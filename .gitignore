@@ -9,6 +9,7 @@
 *.lib
 *.exe
 /venus
+!/venus/
 libvenus.*
 /cmake-build-*/
 /out/
