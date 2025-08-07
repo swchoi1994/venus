@@ -1,0 +1,87 @@
+[package]
+name = "venus"
+version = "0.1.0"
+edition = "2021"
+authors = ["Venus Contributors"]
+description = "Universal cross-platform inference engine with OpenAI-compatible API"
+license = "MIT"
+
+[dependencies]
+# Core dependencies
+tokio = { version = "1.35", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# API server
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+async-trait = "0.1"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Platform detection
+cfg-if = "1.0"
+num_cpus = "1.16"
+sys-info = "0.9"
+
+# Math & SIMD
+ndarray = "0.15"
+packed_simd_2 = { version = "0.3", optional = true }
+rayon = "1.8"
+
+# Model formats
+safetensors = "0.4"
+candle-core = { version = "0.3", optional = true }
+candle-nn = { version = "0.3", optional = true }
+
+# Memory management
+memmap2 = "0.9"
+parking_lot = "0.12"
+
+# Configuration
+config = "0.13"
+clap = { version = "4.4", features = ["derive"] }
+
+# Additional dependencies
+libc = "0.2"
+futures = "0.3"
+async-stream = "0.3"
+
+[features]
+default = ["simd"]
+simd = ["packed_simd_2"]
+candle = ["candle-core", "candle-nn"]
+cuda = []
+metal = []
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.69"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.4"
+tempfile = "3.8"
+
+[[bin]]
+name = "venus"
+path = "src/rust/main.rs"
+
+[lib]
+name = "venus_engine"
+path = "src/rust/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

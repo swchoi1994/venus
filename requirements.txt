@@ -1,0 +1,33 @@
+# Python dependencies for Venus Inference Engine
+
+# API Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# Model conversion
+torch>=2.1.0
+transformers>=4.36.0
+safetensors>=0.4.0
+huggingface-hub>=0.19.0
+accelerate>=0.25.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.66.0
+pyyaml>=6.0
+click>=8.1.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0
+
+# Development
+black>=23.0.0
+ruff>=0.1.0
+mypy>=1.7.0
+
+# Optional accelerations
+# onnxruntime>=1.16.0
+# tensorrt>=8.6.0
