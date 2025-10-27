@@ -1,8 +1,8 @@
-use std::ffi::{CString, CStr};
-use std::os::raw::{c_char, c_int, c_float};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
-use anyhow::{Result, anyhow};
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_float, c_int};
+use std::sync::Arc;
 
 // FFI bindings to C engine
 #[repr(C)]
@@ -34,32 +34,32 @@ extern "C" {
     ) -> *mut c_int;
 }
 
-pub struct VenusEngine {
+pub struct InferXEngine {
     engine: *mut std::ffi::c_void,
     tokenizer: *mut std::ffi::c_void,
     model_name: String,
 }
 
-unsafe impl Send for VenusEngine {}
-unsafe impl Sync for VenusEngine {}
+unsafe impl Send for InferXEngine {}
+unsafe impl Sync for InferXEngine {}
 
-impl VenusEngine {
+impl InferXEngine {
     pub fn new(model_path: &str) -> Result<Self> {
         let c_path = CString::new(model_path)?;
-        
+
         unsafe {
             let engine = create_engine(c_path.as_ptr());
             if engine.is_null() {
                 return Err(anyhow!("Failed to create engine"));
             }
-            
+
             // For now, use the same path for tokenizer
             let tokenizer = create_tokenizer(c_path.as_ptr());
             if tokenizer.is_null() {
                 free_engine(engine);
                 return Err(anyhow!("Failed to create tokenizer"));
             }
-            
+
             Ok(Self {
                 engine,
                 tokenizer,
@@ -67,7 +67,7 @@ impl VenusEngine {
             })
         }
     }
-    
+
     pub fn generate(
         &self,
         prompt: &str,
@@ -77,7 +77,7 @@ impl VenusEngine {
         max_tokens: i32,
     ) -> Result<String> {
         let c_prompt = CString::new(prompt)?;
-        
+
         let mut config = GenerationConfig {
             temperature,
             top_p,
@@ -88,43 +88,43 @@ impl VenusEngine {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
         };
-        
+
         unsafe {
             let result = generate(self.engine, c_prompt.as_ptr(), &mut config);
             if result.is_null() {
                 return Err(anyhow!("Generation failed"));
             }
-            
+
             let c_str = CStr::from_ptr(result);
             let output = c_str.to_string_lossy().into_owned();
-            
+
             // Free the result string
             libc::free(result as *mut libc::c_void);
-            
+
             Ok(output)
         }
     }
-    
+
     pub fn count_tokens(&self, text: &str) -> Result<i32> {
         let c_text = CString::new(text)?;
         let mut n_tokens: c_int = 0;
-        
+
         unsafe {
             let tokens = tokenize(self.tokenizer, c_text.as_ptr(), &mut n_tokens);
             if !tokens.is_null() {
                 libc::free(tokens as *mut libc::c_void);
             }
-            
+
             Ok(n_tokens)
         }
     }
-    
+
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
 }
 
-impl Drop for VenusEngine {
+impl Drop for InferXEngine {
     fn drop(&mut self) {
         unsafe {
             if !self.engine.is_null() {
@@ -139,7 +139,7 @@ impl Drop for VenusEngine {
 
 // Engine manager for multiple models
 pub struct EngineManager {
-    engines: Arc<RwLock<std::collections::HashMap<String, Arc<VenusEngine>>>>,
+    engines: Arc<RwLock<std::collections::HashMap<String, Arc<InferXEngine>>>>,
 }
 
 impl EngineManager {
@@ -148,17 +148,19 @@ impl EngineManager {
             engines: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
-    
+
     pub fn load_model(&self, model_name: &str, model_path: &str) -> Result<()> {
-        let engine = VenusEngine::new(model_path)?;
-        self.engines.write().insert(model_name.to_string(), Arc::new(engine));
+        let engine = InferXEngine::new(model_path)?;
+        self.engines
+            .write()
+            .insert(model_name.to_string(), Arc::new(engine));
         Ok(())
     }
-    
-    pub fn get_engine(&self, model_name: &str) -> Option<Arc<VenusEngine>> {
+
+    pub fn get_engine(&self, model_name: &str) -> Option<Arc<InferXEngine>> {
         self.engines.read().get(model_name).cloned()
     }
-    
+
     pub fn list_models(&self) -> Vec<String> {
         self.engines.read().keys().cloned().collect()
     }

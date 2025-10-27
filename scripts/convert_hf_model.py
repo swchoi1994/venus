@@ -235,19 +235,51 @@ def main():
     parser.add_argument("--quantization", type=str, default="q8_0", 
                        choices=["none", "q8_0", "q4_0"], help="Quantization method")
     parser.add_argument("--device", type=str, default="cpu", help="Device to use for loading")
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="Allow loading models that require custom code")
     
     args = parser.parse_args()
     
     print(f"Loading model from {args.input}")
+
+    input_path = Path(args.input)
+    model_source = str(input_path) if input_path.exists() else args.input
     
     try:
         # Load model and tokenizer
-        if args.device == "cuda" and torch.cuda.is_available():
-            model = AutoModel.from_pretrained(args.input, torch_dtype=torch.float16, device_map="auto")
-        else:
-            model = AutoModel.from_pretrained(args.input, torch_dtype=torch.float32)
-            
-        tokenizer = AutoTokenizer.from_pretrained(args.input)
+        config = AutoConfig.from_pretrained(
+            model_source,
+            trust_remote_code=args.trust_remote_code,
+        )
+
+        def load_model(dtype):
+            load_kwargs = {
+                "torch_dtype": dtype,
+                "trust_remote_code": args.trust_remote_code,
+            }
+
+            if args.device == "cuda" and torch.cuda.is_available():
+                load_kwargs["device_map"] = "auto"
+
+            if config.model_type in {"qwen2_vl", "qwen3_vl"}:
+                from transformers import AutoModelForVision2Seq
+
+                return AutoModelForVision2Seq.from_pretrained(
+                    model_source,
+                    **load_kwargs,
+                )
+            else:
+                return AutoModel.from_pretrained(
+                    model_source,
+                    **load_kwargs,
+                )
+
+        model = load_model(torch.float16 if args.device == "cuda" and torch.cuda.is_available() else torch.float32)
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_source,
+            trust_remote_code=args.trust_remote_code,
+        )
         
         print(f"Model loaded successfully")
         print(f"Model type: {model.config.model_type}")

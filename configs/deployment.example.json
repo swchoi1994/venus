@@ -1,0 +1,31 @@
+{
+  "default_model": "gpt-oss-20b-q4",
+  "models": {
+    "qwen3-vl-4b": {
+      "model_path": "qwen3-vl-4b/qwen3-vl-4b-q4.bin",
+      "tokenizer_path": "qwen3-vl-4b/tokenizer.json",
+      "quant_format": "q4_0",
+      "model_kind": "vlm",
+      "vision": {
+        "image_processor_path": "qwen3-vl-4b/image_processor.json",
+        "projector_path": "qwen3-vl-4b/projector.bin"
+      },
+      "prompt_template": "<image>{image_tokens}</image>\n{dialogue}",
+      "metadata": {
+        "family": "qwen3",
+        "parameters_b": 3.9
+      }
+    },
+    "gpt-oss-20b-q4": {
+      "model_path": "gpt-oss-20b/gpt-oss-20b-q4.bin",
+      "tokenizer_path": "gpt-oss-20b/tokenizer.json",
+      "quant_format": "q4_0",
+      "model_kind": "llm",
+      "prompt_template": "{system}\n{conversation}",
+      "metadata": {
+        "family": "gpt-oss",
+        "parameters_b": 20
+      }
+    }
+  }
+}

@@ -1,11 +1,19 @@
-pub mod api_server;
-pub mod engine;
+pub mod coreshift;
+pub mod inferx;
+pub mod modelrun;
 pub mod models;
-pub mod platform;
+pub mod modulus;
 
-pub use api_server::{ApiServer, ServerConfig};
-pub use engine::VenusEngine;
-pub use models::{ChatMessage, ChatCompletionRequest, ChatCompletionResponse};
-
-// Re-export platform detection
-pub use platform::{detect_platform, get_simd_features};
+pub use coreshift::{
+    detect_platform, get_simd_features, Backend, BackendKind, BackendRegistry, HardwareProfile,
+    Platform, Profiler,
+};
+pub use inferx::{
+    EngineManager, InferXEngine, InferencePipeline, PipelineStage, SchedulerConfig, SchedulerHandle,
+};
+pub use modelrun::{ApiServer, DeploymentConfig, ModelRegistry, ServerConfig};
+pub use models::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage};
+pub use modulus::{
+    ArtifactBundle, ModelArtifacts, ModelKind, QuantizationConfig, QuantizationFormat, Quantizer,
+    VisionAssets,
+};

@@ -1,5 +1,6 @@
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
+use serde_json::Value;
 use uuid::Uuid;
 
 // OpenAI-compatible API models
@@ -10,6 +11,8 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +69,8 @@ pub struct ModelInfo {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,11 +104,54 @@ pub struct DeltaContent {
     pub content: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageAttachment {
+    pub kind: AttachmentKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl MessageAttachment {
+    pub fn describe(&self) -> String {
+        match self.kind {
+            AttachmentKind::Image => {
+                if let Some(url) = &self.url {
+                    format!("[image:url={}]", url)
+                } else if let Some(data) = &self.data {
+                    format!("[image:base64({} bytes)]", data.len())
+                } else {
+                    "[image]".to_string()
+                }
+            }
+        }
+    }
+}
+
 // Default values
-fn default_temperature() -> f32 { 0.7 }
-fn default_max_tokens() -> u32 { 2048 }
-fn default_top_p() -> f32 { 0.9 }
-fn default_top_k() -> i32 { 40 }
+fn default_temperature() -> f32 {
+    0.7
+}
+fn default_max_tokens() -> u32 {
+    2048
+}
+fn default_top_p() -> f32 {
+    0.9
+}
+fn default_top_k() -> i32 {
+    40
+}
 
 // Helper functions
 impl ChatCompletionResponse {
