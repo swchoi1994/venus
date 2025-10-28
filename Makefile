@@ -14,7 +14,7 @@ UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_S),Darwin)
     ifeq ($(UNAME_M),arm64)
         # Apple Silicon
-        CFLAGS += -DPLATFORM_APPLE_SILICON -framework Accelerate
+        CFLAGS += -DPLATFORM_APPLE_SILICON
         LDFLAGS += -framework Accelerate -framework Metal
         PLATFORM = apple_silicon
     endif
@@ -49,7 +49,7 @@ ifdef USE_OPENMP
         LDFLAGS += -fopenmp
     else
         $(warning OpenMP requested but not supported by $(CC); building without OpenMP)
-        CFLAGS += -DUSE_OPENMP
+        # Do not define USE_OPENMP when unsupported to avoid undefined omp_* symbols
     endif
 endif
 

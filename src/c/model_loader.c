@@ -14,30 +14,48 @@
 #define VENUS_MAGIC "VNUS"
 
 ModelFormat detect_format(const char* path) {
+    // Prefer detection by file extension when available
+    const char* dot = strrchr(path, '.');
+    if (dot != NULL) {
+        if (strcmp(dot, ".safetensors") == 0) {
+            return FORMAT_SAFETENSORS;
+        }
+        if (strcmp(dot, ".gguf") == 0) {
+            return FORMAT_GGUF;
+        }
+        if (strcmp(dot, ".venus") == 0) {
+            return FORMAT_VENUS;
+        }
+    }
+
     FILE* f = fopen(path, "rb");
     if (!f) return FORMAT_UNKNOWN;
-    
-    char magic[16];
-    size_t read = fread(magic, 1, 16, f);
+
+    char header[16] = {0};
+    size_t read = fread(header, 1, sizeof(header), f);
     fclose(f);
-    
     if (read < 4) return FORMAT_UNKNOWN;
-    
-    // Check Venus format
-    if (memcmp(magic, VENUS_MAGIC, 4) == 0) {
+
+    // Check Venus format by magic
+    if (memcmp(header, VENUS_MAGIC, 4) == 0) {
         return FORMAT_VENUS;
     }
-    
-    // Check GGUF format
-    if (*(uint32_t*)magic == GGUF_MAGIC) {
+
+    // Check GGUF format by magic
+    if (*(uint32_t*)header == GGUF_MAGIC) {
         return FORMAT_GGUF;
     }
-    
-    // Check safetensors format (JSON header)
-    if (memcmp(magic, SAFETENSORS_MAGIC, strlen(SAFETENSORS_MAGIC)) == 0) {
-        return FORMAT_SAFETENSORS;
+
+    // Heuristic: safetensors starts with 8-byte little-endian JSON header length
+    // If extension missing, treat as safetensors when size looks plausible
+    if (read >= 8) {
+        uint64_t json_len = 0;
+        memcpy(&json_len, header, sizeof(uint64_t));
+        if (json_len > 0 && json_len < (1ULL << 32)) {
+            return FORMAT_SAFETENSORS;
+        }
     }
-    
+
     return FORMAT_UNKNOWN;
 }
 

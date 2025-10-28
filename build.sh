@@ -20,7 +20,7 @@ echo ""
 case "$PLATFORM-$ARCH" in
     Darwin-arm64)
         echo "🍎 Building for Apple Silicon..."
-        export CFLAGS="-O3 -march=native -framework Accelerate"
+        export CFLAGS="-O3 -march=native"
         export RUSTFLAGS="-C target-cpu=native"
         export PLATFORM_NAME="apple-silicon"
         ;;

@@ -56,7 +56,8 @@ futures = "0.3"
 async-stream = "0.3"
 
 [features]
-default = ["simd"]
+# Default build avoids nightly-only packed_simd_2
+default = []
 simd = ["packed_simd_2"]
 candle = ["candle-core", "candle-nn"]
 cuda = []

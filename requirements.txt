@@ -31,3 +31,6 @@ mypy>=1.7.0
 # Optional accelerations
 # onnxruntime>=1.16.0
 # tensorrt>=8.6.0
+ 
+# UI / Demo
+gradio>=4.31.0
