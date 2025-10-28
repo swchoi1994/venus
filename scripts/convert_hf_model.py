@@ -45,6 +45,8 @@ def detect_architecture(config):
         return "llama_vision"
     elif 'Qwen2VLForConditionalGeneration' in arch_str:
         return "qwen2_vl"
+    elif 'Qwen3VLForConditionalGeneration'.lower() in arch_str.lower():
+        return "qwen3_vl"
     elif 'VoxtralForConditionalGeneration' in arch_str:
         return "voxtral"
     
@@ -125,14 +127,14 @@ def save_venus_model(model, tokenizer, output_path, quantization="q8_0"):
         "format": "venus",
         "architecture": detect_architecture(config),
         "model_type": config.model_type,
-        "vocab_size": config.vocab_size,
+        "vocab_size": getattr(config, "vocab_size", getattr(getattr(config, "text_config", None), "vocab_size", 0)),
         "hidden_size": getattr(config, "hidden_size", config.d_model if hasattr(config, "d_model") else 0),
-        "num_layers": getattr(config, "num_hidden_layers", config.n_layer if hasattr(config, "n_layer") else 0),
-        "num_heads": getattr(config, "num_attention_heads", config.n_head if hasattr(config, "n_head") else 0),
-        "num_kv_heads": getattr(config, "num_key_value_heads", config.num_attention_heads),
-        "max_position_embeddings": getattr(config, "max_position_embeddings", 2048),
-        "intermediate_size": getattr(config, "intermediate_size", 0),
-        "rope_theta": getattr(config, "rope_theta", 10000.0),
+        "num_layers": getattr(config, "num_hidden_layers", getattr(getattr(config, "text_config", None), "num_hidden_layers", getattr(config, "n_layer", 0))),
+        "num_heads": getattr(config, "num_attention_heads", getattr(getattr(config, "text_config", None), "num_attention_heads", getattr(config, "n_head", 0))),
+        "num_kv_heads": getattr(config, "num_key_value_heads", getattr(getattr(config, "text_config", None), "num_key_value_heads", getattr(config, "num_attention_heads", 0))),
+        "max_position_embeddings": getattr(config, "max_position_embeddings", getattr(getattr(config, "text_config", None), "max_position_embeddings", 2048)),
+        "intermediate_size": getattr(config, "intermediate_size", getattr(getattr(config, "text_config", None), "intermediate_size", 0)),
+        "rope_theta": getattr(config, "rope_theta", getattr(getattr(config, "text_config", None), "rope_theta", 10000.0)),
         "layer_norm_eps": getattr(config, "layer_norm_epsilon", 1e-6),
         "quantization": quantization,
         "use_gqa": hasattr(config, "num_key_value_heads") and config.num_key_value_heads != config.num_attention_heads,

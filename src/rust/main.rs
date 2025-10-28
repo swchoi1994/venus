@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
-use venus::{ApiServer, ServerConfig};
+use venus_engine::{ApiServer, ServerConfig};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn print_platform_info() {
-    use venus::{detect_platform, get_simd_features};
+    use venus_engine::{detect_platform, get_simd_features};
 
     info!("Platform: {:?}", detect_platform());
     info!("CPU Cores: {}", num_cpus::get());

@@ -184,6 +184,7 @@ async fn chat_completions(
                         role: "assistant".to_string(),
                         content: response_text,
                         name: None,
+                        attachments: Vec::new(),
                     },
                     prompt_tokens,
                     completion_tokens,
@@ -200,8 +201,8 @@ async fn chat_completions(
 }
 
 async fn completions(
-    State(state): State<AppState>,
-    Json(request): Json<serde_json::Value>,
+    State(_state): State<AppState>,
+    Json(_request): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // TODO: Implement completions endpoint
     Ok(Json(serde_json::json!({

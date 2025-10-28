@@ -43,8 +43,14 @@ PLATFORM ?= generic
 
 # OpenMP support
 ifdef USE_OPENMP
-    CFLAGS += -fopenmp -DUSE_OPENMP
-    LDFLAGS += -fopenmp
+    FOPENMP_SUPPORTED := $(shell echo | $(CC) -fopenmp -E - > /dev/null 2>&1 && echo 1 || echo 0)
+    ifeq ($(FOPENMP_SUPPORTED),1)
+        CFLAGS += -fopenmp -DUSE_OPENMP
+        LDFLAGS += -fopenmp
+    else
+        $(warning OpenMP requested but not supported by $(CC); building without OpenMP)
+        CFLAGS += -DUSE_OPENMP
+    endif
 endif
 
 # Source files
