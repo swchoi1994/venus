@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import base64
 import io
+import hashlib
 
 try:
     import torch  # type: ignore
@@ -29,6 +30,7 @@ except Exception:  # pragma: no cover - optional dependency
 MODEL_DIR = Path(os.environ.get("VENUS_MODEL_DIR", "./models")).resolve()
 manifest_models: Dict[str, Dict[str, Any]] = {}
 default_model_name: Optional[str] = None
+MAX_IMAGE_SIDE = int(os.environ.get("VLM_MAX_IMAGE_SIDE", "640"))
 
 # Load the C library
 def load_venus_library():
@@ -443,8 +445,9 @@ def extract_first_image(messages: List[ChatMessage]) -> Optional[Image.Image]:
     return None
 
 
-def extract_images_in_order(messages: List[ChatMessage]) -> List[Image.Image]:
+def extract_images_and_hashes(messages: List[ChatMessage]) -> (List[Image.Image], List[str]):
     images: List[Image.Image] = []
+    hashes: List[str] = []
     for msg in messages:
         if not msg.attachments:
             continue
@@ -452,10 +455,12 @@ def extract_images_in_order(messages: List[ChatMessage]) -> List[Image.Image]:
             if att.kind == "image" and att.data:
                 try:
                     raw = base64.b64decode(att.data)
-                    images.append(Image.open(io.BytesIO(raw)).convert("RGB"))
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    images.append(img)
+                    hashes.append(hashlib.sha1(raw).hexdigest())
                 except Exception:
                     continue
-    return images
+    return images, hashes
 
 
 # HF VLM implementation
@@ -478,6 +483,16 @@ class HFVLMEngine:
             model_dir, torch_dtype=dtype, trust_remote_code=True
         ).to(self.device)
         self.model.eval()
+        self._image_cache: Dict[str, Image.Image] = {}
+        # Prefer channels_last for MPS speedups
+        try:
+            self.model = self.model.to(memory_format=torch.channels_last)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     def generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any]):
         # Build chat with image placeholders using apply_chat_template
@@ -498,8 +513,30 @@ class HFVLMEngine:
             chat, tokenize=False, add_generation_prompt=True
         )
 
-        images = extract_images_in_order(messages)
-        inputs = self.processor(text=prompt_text, images=images or None, return_tensors="pt")
+        images, hashes = extract_images_and_hashes(messages)
+        # Cache decoded PIL to avoid repeated decode cost across turns
+        cache_hits = 0
+        cached_images: List[Image.Image] = []
+        for img, h in zip(images, hashes):
+            if h in self._image_cache:
+                cached_images.append(self._image_cache[h])
+                cache_hits += 1
+            else:
+                self._image_cache[h] = img
+                cached_images.append(img)
+
+        # Resize large images to max side for speed
+        resized: List[Image.Image] = []
+        for img in cached_images:
+            w, h = img.size
+            s = max(w, h)
+            if s > MAX_IMAGE_SIDE:
+                scale = MAX_IMAGE_SIDE / float(s)
+                resized.append(img.resize((int(w * scale), int(h * scale))))
+            else:
+                resized.append(img)
+
+        inputs = self.processor(text=prompt_text, images=(resized or None), return_tensors="pt")
         try:
             inputs = inputs.to(self.device)  # type: ignore[attr-defined]
         except Exception:
@@ -550,8 +587,22 @@ class HFVLMEngine:
             chat, tokenize=False, add_generation_prompt=True
         )
 
-        images = extract_images_in_order(messages)
-        inputs = self.processor(text=prompt_text, images=images or None, return_tensors="pt")
+        images, hashes = extract_images_and_hashes(messages)
+        cached_images: List[Image.Image] = []
+        for img, h in zip(images, hashes):
+            cached_images.append(self._image_cache.get(h, img))
+
+        resized: List[Image.Image] = []
+        for img in cached_images:
+            w, h = img.size
+            s = max(w, h)
+            if s > MAX_IMAGE_SIDE:
+                scale = MAX_IMAGE_SIDE / float(s)
+                resized.append(img.resize((int(w * scale), int(h * scale))))
+            else:
+                resized.append(img)
+
+        inputs = self.processor(text=prompt_text, images=(resized or None), return_tensors="pt")
         try:
             inputs = inputs.to(self.device)
         except Exception:

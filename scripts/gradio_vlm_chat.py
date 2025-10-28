@@ -271,6 +271,12 @@ def app_logic(
             metrics: Metrics = gen.send(None)  # type: ignore[func-returns-value]
         except StopIteration as stop:
             metrics = stop.value  # type: ignore[assignment]
+        except Exception as e:
+            # Fallback to non-stream path if server doesn't support SSE
+            reply, metrics = non_stream_chat(api_base, payload)
+            reply = sanitize_assistant_text(reply)
+            metrics.note = f"fallback: {metrics.note or ''}".strip()
+            yield chat_history + [(user_input, reply)], ""
 
         metrics_box = (
             f"Latency: {metrics.latency_ms:.1f} ms\n"
@@ -305,6 +311,7 @@ def build_ui(default_api: str, launch_share: bool):
                 max_tokens = gr.Slider(16, 4096, value=512, step=16, label="Max new tokens")
             stream = gr.Checkbox(value=False, label="Stream output")
             fast_mode = gr.Checkbox(value=False, label="Fast mode (64 tokens, temp 0.2)")
+            max_image_side = gr.Slider(256, 2048, value=640, step=64, label="Max image side (px)")
             system_prompt = gr.Textbox(label="System Prompt", value="You are a helpful vision assistant.")
 
         with gr.Row():
@@ -330,15 +337,15 @@ def build_ui(default_api: str, launch_share: bool):
 
         clear_btn.click(on_clear, outputs=[chatbot, user_input, metrics_box])
 
-        def apply_fast_mode(stream_val, fast_val, temp, max_new):
+        def apply_fast_mode(stream_val, fast_val, temp, max_new, img_side):
             if fast_val:
-                return True if stream_val else stream_val, 0.2, 64
-            return stream_val, temp, max_new
+                return True if stream_val else stream_val, 0.2, 64, img_side
+            return stream_val, temp, max_new, img_side
 
         send_btn.click(
             fn=apply_fast_mode,
-            inputs=[stream, fast_mode, temperature, max_tokens],
-            outputs=[stream, temperature, max_tokens],
+            inputs=[stream, fast_mode, temperature, max_tokens, max_image_side],
+            outputs=[stream, temperature, max_tokens, max_image_side],
         ).then(
             fn=app_logic,
             inputs=[
