@@ -230,6 +230,13 @@ def save_venus_model(model, tokenizer, output_path, quantization="q8_0"):
     print(f"   Quantized parameters: {quantized_params:,} ({quantized_params/total_params*100:.1f}%)")
     print(f"   Tokenizer saved to: {tokenizer_path}")
 
+    return {
+        "model_path": str(Path(output_path).resolve()),
+        "tokenizer_path": str(tokenizer_path.resolve()),
+        "quantization": quantization,
+        "header": header,
+    }
+
 def main():
     parser = argparse.ArgumentParser(description="Convert HF models to Venus format")
     parser.add_argument("--input", type=str, required=True, help="Input model path or HF model ID")
@@ -239,6 +246,14 @@ def main():
     parser.add_argument("--device", type=str, default="cpu", help="Device to use for loading")
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="Allow loading models that require custom code")
+    # Venus package options
+    parser.add_argument("--backend", type=str, default="standard", choices=["standard", "bitnet-sim"],
+                        help="Target backend metadata: standard or bitnet-sim (flag only; no custom kernels)")
+    parser.add_argument("--rec-enabled", action="store_true", help="Default: enable recursive controller")
+    parser.add_argument("--rec-depth", type=int, default=3, help="Default recursion depth")
+    parser.add_argument("--rec-beam", type=int, default=1, help="Default recursion beam width")
+    parser.add_argument("--emit-config", action="store_true", help="Write sidecar venus_config.json next to output")
+    parser.add_argument("--print-deploy-snippet", action="store_true", help="Print deployment.json snippet to stdout")
     
     args = parser.parse_args()
     
@@ -288,7 +303,49 @@ def main():
         
         # Convert and save
         print(f"\nConverting with {args.quantization} quantization")
-        save_venus_model(model, tokenizer, args.output, args.quantization)
+        result = save_venus_model(model, tokenizer, args.output, args.quantization)
+
+        # Venus package sidecar config (optional)
+        if args.emit_config:
+            pkg = {
+                "format": "venus-package",
+                "version": 1,
+                "weights": result["model_path"],
+                "tokenizer": result["tokenizer_path"],
+                "backend": args.backend,
+                "bitnet_b1_58": {"enabled": args.backend.startswith("bitnet")},
+                "recursive_reasoning": {
+                    "enabled": bool(args.rec_enabled),
+                    "max_depth": int(args.rec_depth),
+                    "beam_width": int(args.rec_beam),
+                },
+                "quantization": result["quantization"],
+                "meta": {
+                    "source": args.input,
+                },
+            }
+            cfg_path = Path(args.output).with_suffix(".venus.config.json")
+            cfg_path.write_text(json.dumps(pkg, indent=2))
+            print(f"   Venus package config: {cfg_path}")
+
+        if args.print_deploy_snippet:
+            stem = Path(args.output).stem
+            snippet = {
+                stem: {
+                    "model_kind": "llm",
+                    "model_path": str(Path(result["model_path"]).name),
+                    "tokenizer_path": str(Path(result["tokenizer_path"]).name),
+                    "quant_format": result["quantization"],
+                    "recursive_reasoning": {
+                        "enabled": bool(args.rec_enabled),
+                        "max_depth": int(args.rec_depth),
+                        "beam_width": int(args.rec_beam),
+                    },
+                    "bitnet_b1_58": {"enabled": args.backend.startswith("bitnet")},
+                }
+            }
+            print("\nAdd this to models/deployment.json under 'models':\n")
+            print(json.dumps(snippet, indent=2))
         
     except Exception as e:
         print(f"❌ Error: {e}")

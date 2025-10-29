@@ -111,6 +111,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     user: Optional[str] = None
+    venus_options: Optional[Dict[str, Any]] = None
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -320,6 +321,14 @@ async def chat_completions(request: ChatCompletionRequest):
     # Prefer VLM engine if exists
     vlm_engine = engine_manager.get_vlm_engine(request.model)
     if vlm_engine is not None:
+        # For simplicity, recursion is disabled in streaming mode
+        # Optional per-request VLM max image side
+        max_side_opt = None
+        if request.venus_options and isinstance(request.venus_options.get("max_image_side"), (int, float, str)):
+            try:
+                max_side_opt = int(request.venus_options.get("max_image_side"))
+            except Exception:
+                max_side_opt = None
         if request.stream:
             async def vlm_event_stream():
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
@@ -337,7 +346,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     "top_p": request.top_p,
                     "top_k": request.top_k,
                     "max_tokens": request.max_tokens,
-                }):
+                }, max_image_side=max_side_opt):
                     content_chunk = {
                         "id": chunk_id,
                         "object": "chat.completion.chunk",
@@ -359,12 +368,44 @@ async def chat_completions(request: ChatCompletionRequest):
 
             return StreamingResponse(vlm_event_stream(), media_type="text/event-stream")
 
-        text_response, usage = vlm_engine.generate(request.messages, {
-            "temperature": request.temperature,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "max_tokens": request.max_tokens,
-        })
+        # Optional recursive controller for VLM via request.venus_options or manifest
+        model_cfg = manifest_models.get(request.model, {})
+        rec_cfg = None
+        if request.venus_options and isinstance(request.venus_options.get("recursive_reasoning"), dict):
+            rec_cfg = request.venus_options.get("recursive_reasoning")
+        elif isinstance(model_cfg.get("recursive_reasoning"), dict):
+            rec_cfg = model_cfg.get("recursive_reasoning")
+
+        def _vlm_generate_once(msgs: List[ChatMessage]):
+            return vlm_engine.generate(msgs, {
+                "temperature": request.temperature,
+                "top_p": request.top_p,
+                "top_k": request.top_k,
+                "max_tokens": request.max_tokens,
+            }, max_image_side=max_side_opt)
+
+        text_response: str
+        usage: Dict[str, Any]
+
+        if rec_cfg and rec_cfg.get("enabled"):
+            max_depth = int(rec_cfg.get("max_depth", 3))
+            beam_width = int(rec_cfg.get("beam_width", 1))
+            # Simple recursive loop: append assistant hypotheses as new messages
+            working_messages: List[ChatMessage] = list(request.messages)
+            best_text: str = ""
+            best_usage: Dict[str, Any] = {}
+            for _ in range(max_depth):
+                candidates: List[tuple[str, Dict[str, Any]]] = []
+                for _b in range(max(1, beam_width)):
+                    t, u = _vlm_generate_once(working_messages)
+                    candidates.append((t, u))
+                # Trivial selection: pick the longest candidate (proxy for completeness)
+                text, u = max(candidates, key=lambda x: len(x[0]) if x[0] else 0)
+                working_messages = working_messages + [ChatMessage(role="assistant", content=text)]
+                best_text, best_usage = text, u
+            text_response, usage = best_text, best_usage
+        else:
+            text_response, usage = _vlm_generate_once(request.messages)
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
             created=int(time.time()),
@@ -401,7 +442,41 @@ async def chat_completions(request: ChatCompletionRequest):
             media_type="text/event-stream"
         )
 
-    response_text = engine.generate(prompt, config)
+    # Inspect BitNet config and surface a notice for now (no accelerated kernels yet)
+    model_cfg = manifest_models.get(request.model, {})
+    bit_cfg = None
+    if request.venus_options and isinstance(request.venus_options.get("bitnet_b1_58"), dict):
+        bit_cfg = request.venus_options.get("bitnet_b1_58")
+    elif isinstance(model_cfg.get("bitnet_b1_58"), dict):
+        bit_cfg = model_cfg.get("bitnet_b1_58")
+    if bit_cfg and bit_cfg.get("enabled"):
+        print(f"[warn] bitnet_b1_58 enabled for {request.model} but accelerated kernels are not yet available; using standard decode.")
+
+    # Optional recursive controller for LLM via request.venus_options or manifest
+    rec_cfg = None
+    if request.venus_options and isinstance(request.venus_options.get("recursive_reasoning"), dict):
+        rec_cfg = request.venus_options.get("recursive_reasoning")
+    elif isinstance(model_cfg.get("recursive_reasoning"), dict):
+        rec_cfg = model_cfg.get("recursive_reasoning")
+
+    if rec_cfg and rec_cfg.get("enabled") and not request.stream:
+        max_depth = int(rec_cfg.get("max_depth", 3))
+        beam_width = int(rec_cfg.get("beam_width", 1))
+        # Build working scratchpad from chat
+        working_prompt = prompt
+        best_text = ""
+        for _ in range(max_depth):
+            candidates: List[str] = []
+            for _b in range(max(1, beam_width)):
+                t = engine.generate(working_prompt, config)
+                candidates.append(t)
+            # Select the longest candidate as a simple heuristic
+            best_text = max(candidates, key=lambda x: len(x) if x else 0)
+            # Append to scratchpad
+            working_prompt = working_prompt + f"\nassistant: {best_text}"
+        response_text = best_text
+    else:
+        response_text = engine.generate(prompt, config)
     prompt_tokens = engine.count_tokens(prompt)
     completion_tokens = engine.count_tokens(response_text)
 
@@ -484,6 +559,8 @@ class HFVLMEngine:
         ).to(self.device)
         self.model.eval()
         self._image_cache: Dict[str, Image.Image] = {}
+        # Cache of resized images keyed by (sha1, side_cap)
+        self._resized_cache: Dict[str, Dict[int, Image.Image]] = {}
         # Prefer channels_last for MPS speedups
         try:
             self.model = self.model.to(memory_format=torch.channels_last)  # type: ignore[arg-type]
@@ -494,7 +571,7 @@ class HFVLMEngine:
         except Exception:
             pass
 
-    def generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any]):
+    def generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any], *, max_image_side: Optional[int] = None):
         # Build chat with image placeholders using apply_chat_template
         chat: List[Dict[str, Any]] = []
         for m in messages:
@@ -527,14 +604,25 @@ class HFVLMEngine:
 
         # Resize large images to max side for speed
         resized: List[Image.Image] = []
-        for img in cached_images:
-            w, h = img.size
-            s = max(w, h)
-            if s > MAX_IMAGE_SIDE:
-                scale = MAX_IMAGE_SIDE / float(s)
-                resized.append(img.resize((int(w * scale), int(h * scale))))
+        side_cap = int(max_image_side) if max_image_side else MAX_IMAGE_SIDE
+        for img, h in zip(cached_images, hashes):
+            # Check per-hash resized cache
+            cached_by_side = self._resized_cache.get(h)
+            if cached_by_side and side_cap in cached_by_side:
+                resized.append(cached_by_side[side_cap])
+                continue
+            w, ih = img.size
+            s = max(w, ih)
+            if s > side_cap:
+                scale = side_cap / float(s)
+                rimg = img.resize((int(w * scale), int(ih * scale)))
             else:
-                resized.append(img)
+                rimg = img
+            resized.append(rimg)
+            # Update cache
+            if h not in self._resized_cache:
+                self._resized_cache[h] = {}
+            self._resized_cache[h][side_cap] = rimg
 
         inputs = self.processor(text=prompt_text, images=(resized or None), return_tensors="pt")
         try:
@@ -569,7 +657,7 @@ class HFVLMEngine:
         }
         return text, usage
 
-    async def stream_generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any]):
+    async def stream_generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any], *, max_image_side: Optional[int] = None):
         chat: List[Dict[str, Any]] = []
         for m in messages:
             content_items: List[Dict[str, Any]] = []
@@ -593,14 +681,23 @@ class HFVLMEngine:
             cached_images.append(self._image_cache.get(h, img))
 
         resized: List[Image.Image] = []
-        for img in cached_images:
-            w, h = img.size
-            s = max(w, h)
-            if s > MAX_IMAGE_SIDE:
-                scale = MAX_IMAGE_SIDE / float(s)
-                resized.append(img.resize((int(w * scale), int(h * scale))))
+        side_cap = int(max_image_side) if max_image_side else MAX_IMAGE_SIDE
+        for img, h in zip(cached_images, hashes):
+            cached_by_side = self._resized_cache.get(h)
+            if cached_by_side and side_cap in cached_by_side:
+                resized.append(cached_by_side[side_cap])
+                continue
+            w, ih = img.size
+            s = max(w, ih)
+            if s > side_cap:
+                scale = side_cap / float(s)
+                rimg = img.resize((int(w * scale), int(ih * scale)))
             else:
-                resized.append(img)
+                rimg = img
+            resized.append(rimg)
+            if h not in self._resized_cache:
+                self._resized_cache[h] = {}
+            self._resized_cache[h][side_cap] = rimg
 
         inputs = self.processor(text=prompt_text, images=(resized or None), return_tensors="pt")
         try:
