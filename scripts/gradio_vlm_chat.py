@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gradio app for EdgeFlow VLM chat with image upload and live metrics.
+Gradio app for EdgeFlow AI VLM chat with image upload and live metrics.
 
 Features:
 - Image upload (persistent across turns until changed)
@@ -297,9 +297,9 @@ def app_logic(
 
 
 def build_ui(default_api: str, launch_share: bool):
-    with gr.Blocks(title="EdgeFlow VLM Chat") as demo:
+    with gr.Blocks(title="Venus VLM Chat") as demo:
         gr.Markdown("""
-        **EdgeFlow VLM Chat** — Upload an image and chat with the model. Metrics show latency and throughput.
+        **Venus VLM Chat** — Upload an image and chat with the model. Metrics show latency and throughput.
         """)
 
         with gr.Row():

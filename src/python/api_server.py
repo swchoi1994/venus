@@ -397,7 +397,11 @@ app.add_middleware(
 # Routes
 @app.get("/")
 async def root():
-    return {"message": "Venus Inference Engine API Server"}
+    return {
+        "message": "Venus Inference Engine API Server",
+        "version": "0.1.0",
+        "docs": "/docs",
+    }
 
 @app.get("/health")
 async def health():

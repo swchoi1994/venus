@@ -118,7 +118,7 @@ def run_venus(
         response = requests.post(f"{url}/v1/chat/completions", json=payload, timeout=600)
         duration = time.perf_counter() - start
         if response.status_code != 200:
-            raise RuntimeError(f"EdgeFlow request failed: {response.status_code} {response.text}")
+            raise RuntimeError(f"Venus request failed: {response.status_code} {response.text}")
 
         data = response.json()
         usage = data.get("usage") or {}
@@ -181,29 +181,31 @@ def run_baseline(model_id: str, prompt: str, image: Path, warmup: int, runs: int
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark EdgeFlow versus baseline VLM inference.")
-    parser.add_argument("--edgeflow", required=True, help="EdgeFlow server base URL (e.g., http://localhost:8000)")
+    parser = argparse.ArgumentParser(description="Benchmark EdgeFlow AI VLM versus baseline VLM inference.")
+    parser.add_argument("--venus", required=True, help="EdgeFlow AI server base URL (e.g., http://localhost:8000)")
+    parser.add_argument("--model", default="qwen3-vl-8b", help="Model name to use on Venus server")
     parser.add_argument("--baseline", help="Hugging Face model id for baseline comparison")
     parser.add_argument("--prompt", required=True, help="Prompt text to evaluate")
     parser.add_argument("--image", required=True, type=Path, help="Path to an input image")
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup iterations per target")
     parser.add_argument("--runs", type=int, default=3, help="Number of timed iterations per target")
-    parser.add_argument("--max-tokens", type=int, default=128, help="Max new tokens for EdgeFlow and baseline")
+    parser.add_argument("--max-tokens", type=int, default=128, help="Max new tokens for Venus and baseline")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature for both runs")
-    parser.add_argument("--recursive", action="store_true", help="Enable recursive controller on EdgeFlow run")
+    parser.add_argument("--recursive", action="store_true", help="Enable recursive controller on Venus run")
     parser.add_argument("--rec-depth", type=int, default=3, help="Recursive max depth")
     parser.add_argument("--rec-beam", type=int, default=1, help="Recursive beam width")
-    parser.add_argument("--vlm-max-side", type=int, default=None, help="Cap VLM max image side (pixels) per request")
+    parser.add_argument("--vlm-max-side", type=int, default=640, help="Cap VLM max image side (pixels) per request")
     args = parser.parse_args()
 
     if not args.image.exists():
         parser.error(f"image path {args.image} does not exist")
 
-    print("Running EdgeFlow benchmark..." + (" (recursive)" if args.recursive else ""))
-    edgeflow_stats = run_edgeflow(
-        args.edgeflow.rstrip("/"),
+    print(f"Running Venus benchmark (model: {args.model})..." + (" (recursive)" if args.recursive else ""))
+    venus_stats = run_venus(
+        args.venus.rstrip("/"),
         args.prompt,
         args.image,
+        args.model,
         args.warmup,
         args.runs,
         recursive=args.recursive,
@@ -213,8 +215,8 @@ def main() -> None:
         temperature=args.temperature,
         vlm_max_side=args.vlm_max_side,
     )
-    print(f"EdgeFlow{'(rec)' if args.recursive else ''} latency: {edgeflow_stats['latency_ms']:.2f} ms (p95 {edgeflow_stats['latency_p95_ms']:.2f} ms)")
-    print(f"EdgeFlow{'(rec)' if args.recursive else ''} tokens/sec: {edgeflow_stats['tokens_per_second']:.2f}")
+    print(f"Venus{'(rec)' if args.recursive else ''} latency: {venus_stats['latency_ms']:.2f} ms (p95 {venus_stats['latency_p95_ms']:.2f} ms)")
+    print(f"Venus{'(rec)' if args.recursive else ''} tokens/sec: {venus_stats['tokens_per_second']:.2f}")
 
     if args.baseline:
         print("\nRunning baseline benchmark...")
@@ -231,7 +233,7 @@ def main() -> None:
             print(f"Baseline  latency: {baseline_stats['latency_ms']:.2f} ms (p95 {baseline_stats['latency_p95_ms']:.2f} ms)")
             print(f"Baseline  tokens/sec: {baseline_stats['tokens_per_second']:.2f}")
 
-            speedup = baseline_stats["latency_ms"] / edgeflow_stats["latency_ms"]
+            speedup = baseline_stats["latency_ms"] / venus_stats["latency_ms"]
             print(f"\nEstimated latency speedup: {speedup:.2f}x")
         else:
             print("Baseline benchmark skipped.")

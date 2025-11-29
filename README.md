@@ -81,6 +81,54 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+## VLM Setup (Vision Language Models)
+
+For VLM models like Qwen2-VL or Qwen3-VL, you need to set up a `deployment.json` in your models directory:
+
+### 1. Download VLM Model
+
+```bash
+# Download Qwen3-VL-8B (or any VLM)
+python scripts/download_model.py --model Qwen/Qwen2-VL-7B-Instruct --output-dir ./models
+```
+
+### 2. Create deployment.json
+
+Create `models/deployment.json`:
+
+```json
+{
+  "default_model": "qwen2-vl-7b",
+  "models": {
+    "qwen2-vl-7b": {
+      "model_kind": "vlm",
+      "hf_model_dir": "Qwen_Qwen2-VL-7B-Instruct"
+    }
+  }
+}
+```
+
+### 3. Start Server with VLM
+
+```bash
+# For optimal VLM performance (~4 seconds for 8B model):
+VLM_MAX_IMAGE_SIDE=640 python src/python/api_server.py --model-dir ./models --port 8000
+```
+
+### 4. Test VLM with Gradio UI
+
+```bash
+python scripts/gradio_vlm_chat.py --api http://localhost:8000 --share
+```
+
+### VLM Performance Tips
+
+For ~4 second inference on Qwen3-VL-8B:
+- Set `VLM_MAX_IMAGE_SIDE=640` (default) to resize large images
+- Use GPU with Flash Attention 2 when available
+- Enable `torch.compile` on CUDA: `VENUS_TORCH_COMPILE=1`
+- Use FP16 precision (automatic on GPU/MPS)
+
 ## Environment Variables
 
 | Variable | Values | Description |
