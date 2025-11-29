@@ -116,10 +116,13 @@ def detect_architecture(config):
     
     return "unknown"
 
-def save_venus_model(model, tokenizer, output_path, quantization="q8_0"):
+def save_venus_model(model, processor, output_path, quantization="q8_0"):
     """Save model in Venus format"""
     
     config = model.config
+    
+    # Check for vision model to extract vision-specific config
+    is_vision_model = hasattr(config, "vision_config")
     
     # Create header with model metadata
     header = {
@@ -127,23 +130,42 @@ def save_venus_model(model, tokenizer, output_path, quantization="q8_0"):
         "format": "venus",
         "architecture": detect_architecture(config),
         "model_type": config.model_type,
-        "vocab_size": getattr(config, "vocab_size", getattr(getattr(config, "text_config", None), "vocab_size", 0)),
-        "hidden_size": getattr(config, "hidden_size", config.d_model if hasattr(config, "d_model") else 0),
-        "num_layers": getattr(config, "num_hidden_layers", getattr(getattr(config, "text_config", None), "num_hidden_layers", getattr(config, "n_layer", 0))),
-        "num_heads": getattr(config, "num_attention_heads", getattr(getattr(config, "text_config", None), "num_attention_heads", getattr(config, "n_head", 0))),
-        "num_kv_heads": getattr(config, "num_key_value_heads", getattr(getattr(config, "text_config", None), "num_key_value_heads", getattr(config, "num_attention_heads", 0))),
-        "max_position_embeddings": getattr(config, "max_position_embeddings", getattr(getattr(config, "text_config", None), "max_position_embeddings", 2048)),
-        "intermediate_size": getattr(config, "intermediate_size", getattr(getattr(config, "text_config", None), "intermediate_size", 0)),
-        "rope_theta": getattr(config, "rope_theta", getattr(getattr(config, "text_config", None), "rope_theta", 10000.0)),
-        "layer_norm_eps": getattr(config, "layer_norm_epsilon", 1e-6),
+        "vocab_size": getattr(config, "vocab_size", getattr(getattr(config, "text_config", {}), "vocab_size", 0)),
+        "hidden_size": getattr(config, "hidden_size", getattr(getattr(config, "text_config", {}), "hidden_size", 0)),
+        "num_layers": getattr(config, "num_hidden_layers", getattr(getattr(config, "text_config", {}), "num_hidden_layers", 0)),
+        "num_heads": getattr(config, "num_attention_heads", getattr(getattr(config, "text_config", {}), "num_attention_heads", 0)),
+        "num_kv_heads": getattr(config, "num_key_value_heads", getattr(getattr(config, "text_config", {}), "num_key_value_heads", 0)),
+        "max_position_embeddings": getattr(config, "max_position_embeddings", getattr(getattr(config, "text_config", {}), "max_position_embeddings", 2048)),
+        "intermediate_size": getattr(config, "intermediate_size", getattr(getattr(config, "text_config", {}), "intermediate_size", 0)),
+        "rope_theta": getattr(config, "rope_theta", getattr(getattr(config, "text_config", {}), "rope_theta", 10000.0)),
+        "layer_norm_eps": getattr(config, "layer_norm_epsilon", getattr(getattr(config, "text_config", {}), "rms_norm_eps", 1e-6)),
         "quantization": quantization,
         "use_gqa": hasattr(config, "num_key_value_heads") and config.num_key_value_heads != config.num_attention_heads,
         "use_rope": True,  # Most modern models use RoPE
         "bos_token_id": getattr(config, "bos_token_id", 1),
         "eos_token_id": getattr(config, "eos_token_id", 2),
         "pad_token_id": getattr(config, "pad_token_id", 0),
+        "is_vision_model": is_vision_model,
     }
     
+    if is_vision_model:
+        vision_config = config.vision_config
+        header["vision_config"] = {
+            "model_type": vision_config.model_type,
+            "hidden_size": vision_config.hidden_size,
+            "intermediate_size": vision_config.intermediate_size,
+            "num_hidden_layers": vision_config.num_hidden_layers,
+            "num_attention_heads": vision_config.num_attention_heads,
+            "image_size": vision_config.image_size,
+            "patch_size": vision_config.patch_size,
+        }
+        # Add projector config if it exists
+        if hasattr(config, "projector_config"):
+             header["projector_config"] = {
+                 "hidden_size": config.projector_config.hidden_size,
+                 "intermediate_size": config.projector_config.intermediate_size,
+             }
+
     print(f"Model configuration:")
     for key, value in header.items():
         print(f"  {key}: {value}")
@@ -218,10 +240,20 @@ def save_venus_model(model, tokenizer, output_path, quantization="q8_0"):
             if actual_quantization != "none":
                 quantized_params += param.numel()
     
-    # Save tokenizer
-    tokenizer_path = Path(output_path).parent / f"{Path(output_path).stem}_tokenizer"
-    tokenizer.save_pretrained(tokenizer_path)
+    # Save tokenizer and image processor
+    output_dir = Path(output_path).parent
+    tokenizer_path = output_dir / f"{Path(output_path).stem}_tokenizer"
     
+    # Some processors have the tokenizer nested, some are the tokenizer
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer.save_pretrained(tokenizer_path)
+    else:
+        processor.save_pretrained(tokenizer_path)
+    
+    if is_vision_model and hasattr(processor, "image_processor"):
+        processor.image_processor.save_pretrained(tokenizer_path)
+        print(f"   Image processor config saved to: {tokenizer_path}")
+
     # Print statistics
     file_size = Path(output_path).stat().st_size
     print(f"\n✅ Model saved to {output_path}")
@@ -268,6 +300,9 @@ def main():
             model_source,
             trust_remote_code=args.trust_remote_code,
         )
+        
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(model_source, trust_remote_code=args.trust_remote_code)
 
         def load_model(dtype):
             load_kwargs = {
@@ -293,17 +328,12 @@ def main():
 
         model = load_model(torch.float16 if args.device == "cuda" and torch.cuda.is_available() else torch.float32)
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_source,
-            trust_remote_code=args.trust_remote_code,
-        )
-        
         print(f"Model loaded successfully")
         print(f"Model type: {model.config.model_type}")
         
         # Convert and save
         print(f"\nConverting with {args.quantization} quantization")
-        result = save_venus_model(model, tokenizer, args.output, args.quantization)
+        result = save_venus_model(model, processor, args.output, args.quantization)
 
         # Venus package sidecar config (optional)
         if args.emit_config:

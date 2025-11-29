@@ -1,6 +1,7 @@
 #include "platform.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -9,6 +10,10 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#endif
+
+#ifdef USE_OPENCL
+#include "opencl/opencl_backend.h"
 #endif
 
 // External platform implementations
@@ -26,6 +31,13 @@ extern void cleanup_generic(void);
 static Platform current_platform = PLATFORM_GENERIC;
 static SimdOps* current_ops = NULL;
 static PlatformInfo* current_info = NULL;
+
+static bool use_metal_for_gemm = false;
+static GPUBackend active_gpu_backend = GPU_BACKEND_NONE;
+
+#ifdef USE_OPENCL
+static OpenCLBackend* opencl_backend = NULL;
+#endif
 
 // Platform detection
 Platform detect_platform(void) {
@@ -74,12 +86,27 @@ Platform detect_platform(void) {
 void init_platform(void) {
     current_platform = detect_platform();
     
+    // Check for environment variable to enable Metal
+    char* use_metal_env = getenv("VENUS_USE_METAL");
+    if (use_metal_env && strcmp(use_metal_env, "1") == 0) {
+        use_metal_for_gemm = true;
+    }
+    
+    // Check for environment variable to enable OpenCL
+    char* use_opencl_env = getenv("VENUS_USE_OPENCL");
+    bool use_opencl = (use_opencl_env && strcmp(use_opencl_env, "1") == 0);
+    
     switch (current_platform) {
         case PLATFORM_APPLE_SILICON_ENUM:
-#if defined(__APPLE__) && defined(__arm64__)
+#if defined(__APPLE__) && defined(__aarch64__)
             current_ops = get_apple_silicon_ops();
             current_info = get_apple_silicon_info();
             init_apple_silicon();
+            if (use_metal_for_gemm) {
+                init_metal();
+                active_gpu_backend = GPU_BACKEND_METAL;
+                if (current_info) current_info->has_metal = true;
+            }
 #else
             current_ops = get_generic_ops();
             current_info = get_generic_info();
@@ -166,14 +193,29 @@ void init_platform(void) {
             init_generic();
             break;
     }
+    
+    // Initialize OpenCL if requested or auto-detect
+#ifdef USE_OPENCL
+    if (use_opencl || getenv("VENUS_OPENCL_DEVICE")) {
+        init_opencl();
+    }
+#endif
+    (void)use_opencl;  // Suppress unused warning when OpenCL disabled
 }
 
 // Cleanup platform
 void cleanup_platform(void) {
+#ifdef USE_OPENCL
+    cleanup_opencl();
+#endif
+    
     switch (current_platform) {
         case PLATFORM_APPLE_SILICON_ENUM:
-#if defined(__APPLE__) && defined(__arm64__)
+#if defined(__APPLE__) && defined(__aarch64__)
             cleanup_apple_silicon();
+            if (use_metal_for_gemm) {
+                cleanup_metal();
+            }
 #else
             cleanup_generic();
 #endif
@@ -294,3 +336,72 @@ void set_thread_affinity(int thread_id, int core_id) {
     (void)thread_id;
     (void)core_id;
 }
+
+// ============================================================================
+// GPU Backend Management
+// ============================================================================
+
+GPUBackend get_active_gpu_backend(void) {
+    return active_gpu_backend;
+}
+
+void set_gpu_backend(GPUBackend backend) {
+    active_gpu_backend = backend;
+}
+
+// ============================================================================
+// OpenCL Backend
+// ============================================================================
+
+#ifdef USE_OPENCL
+
+void init_opencl(void) {
+    if (opencl_backend) return;  // Already initialized
+    
+    // Check for force CPU mode
+    char* force_cpu = getenv("VENUS_FORCE_CPU");
+    if (force_cpu && strcmp(force_cpu, "1") == 0) {
+        printf("[platform] OpenCL disabled (VENUS_FORCE_CPU=1)\n");
+        return;
+    }
+    
+    // Initialize from environment or auto-detect
+    opencl_backend = opencl_init_from_env();
+    
+    if (opencl_backend) {
+        active_gpu_backend = GPU_BACKEND_OPENCL;
+        if (current_info) {
+            current_info->has_opencl = true;
+            current_info->gpu_backend = GPU_BACKEND_OPENCL;
+            current_info->gpu_name = opencl_backend->info.name;
+            current_info->gpu_memory = opencl_backend->info.global_mem_size;
+        }
+        printf("[platform] OpenCL initialized: %s\n", opencl_backend->info.name);
+        opencl_print_device_info(&opencl_backend->info);
+    } else {
+        printf("[platform] OpenCL initialization failed: %s\n", opencl_get_error());
+    }
+}
+
+void cleanup_opencl(void) {
+    if (opencl_backend) {
+        opencl_cleanup(opencl_backend);
+        opencl_backend = NULL;
+        if (active_gpu_backend == GPU_BACKEND_OPENCL) {
+            active_gpu_backend = GPU_BACKEND_NONE;
+        }
+    }
+}
+
+bool is_opencl_available(void) {
+    return opencl_backend != NULL && opencl_backend->initialized;
+}
+
+const char* get_opencl_device_name(void) {
+    if (opencl_backend && opencl_backend->initialized) {
+        return opencl_backend->info.name;
+    }
+    return NULL;
+}
+
+#endif // USE_OPENCL

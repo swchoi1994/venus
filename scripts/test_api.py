@@ -4,6 +4,7 @@
 import requests
 import json
 import sys
+import time
 
 def test_api(base_url="http://localhost:8000"):
     """Test the Venus API endpoints"""
@@ -34,7 +35,7 @@ def test_api(base_url="http://localhost:8000"):
     print("\n3. Testing chat completion...")
     try:
         payload = {
-            "model": "demo-model",
+            "model": "venus-test",
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Hello! Can you tell me a short joke?"}

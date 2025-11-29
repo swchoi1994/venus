@@ -15,6 +15,7 @@ typedef enum {
     PLATFORM_APPLE_SILICON_ENUM,
     PLATFORM_X86_64,
     PLATFORM_ARM64,
+    PLATFORM_ADRENO,          // Qualcomm Adreno GPU
     PLATFORM_RISCV64,
     PLATFORM_MIPS,            // MIPS processors
     PLATFORM_MIPS64,          // 64-bit MIPS
@@ -27,6 +28,15 @@ typedef enum {
     PLATFORM_WASM32,          // WebAssembly 32-bit
     PLATFORM_WASM64           // WebAssembly 64-bit
 } Platform;
+
+// GPU backend types
+typedef enum {
+    GPU_BACKEND_NONE = 0,
+    GPU_BACKEND_METAL,        // Apple Metal
+    GPU_BACKEND_OPENCL,       // Universal OpenCL
+    GPU_BACKEND_VULKAN,       // Vulkan compute
+    GPU_BACKEND_CUDA          // NVIDIA CUDA
+} GPUBackend;
 
 // SIMD operations interface
 typedef struct {
@@ -71,6 +81,14 @@ typedef struct {
     bool has_neon;
     bool has_sve;
     bool has_amx;
+    
+    // GPU information
+    GPUBackend gpu_backend;
+    const char* gpu_name;
+    size_t gpu_memory;
+    bool has_opencl;
+    bool has_metal;
+    bool has_vulkan;
 } PlatformInfo;
 
 // Platform detection and initialization
@@ -81,6 +99,24 @@ SimdOps* get_platform_ops(void);
 // Platform-specific initialization
 void init_platform(void);
 void cleanup_platform(void);
+
+// Metal backend (Apple Silicon only)
+#if defined(__APPLE__) && defined(__aarch64__)
+void init_metal(void);
+void cleanup_metal(void);
+#endif
+
+// OpenCL backend
+#ifdef USE_OPENCL
+void init_opencl(void);
+void cleanup_opencl(void);
+bool is_opencl_available(void);
+const char* get_opencl_device_name(void);
+#endif
+
+// GPU backend selection
+GPUBackend get_active_gpu_backend(void);
+void set_gpu_backend(GPUBackend backend);
 
 // Utility functions
 const char* get_platform_name(void);

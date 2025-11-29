@@ -157,9 +157,24 @@ yarn-error.log*
 /runs/
 /experiments/
 
+# ModernBERT experiments (WIP - to be implemented later)
+scripts/ModernBERT-base-dllm.py
+scripts/ModernBERT-base-eval-hf.py
+scripts/ModernBERT-base-eval.py
+scripts/ModernBERT-sim-test.py
+scripts/hf_models/
+
+# Internal/development scripts (not for release)
+scripts/benchmark_models.py
+scripts/benchmark_recursive.py
+scripts/compare_models.py
+scripts/create_demo_model.py
+scripts/create_test_model.py
+
 # Internal planning documents
 CLAUDE.md
 DESIGN.md
+ROADMAP.md
 plan.md
 BEFORE_PUSH_CHECKLIST.md
 

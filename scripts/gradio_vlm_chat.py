@@ -45,9 +45,9 @@ def list_models(api_base: str) -> List[str]:
         resp = requests.get(f"{api_base.rstrip('/')}/v1/models", timeout=15)
         data = resp.json()
         ids = [m["id"] for m in data.get("data", [])]
-        return ids or ["qwen3-vl-4b"]
+        return ids or []
     except Exception:
-        return ["qwen3-vl-4b"]
+        return []
 
 
 def encode_image_to_base64(image_bytes: bytes) -> str:
@@ -107,6 +107,7 @@ def build_payload(
     max_tokens: int,
     top_p: float,
     top_k: int,
+    recursive: bool,
 ) -> Dict[str, Any]:
     payload_messages = list(messages)
     user_msg: Dict[str, Any] = {"role": "user", "content": user_input}
@@ -124,6 +125,7 @@ def build_payload(
         "top_p": top_p,
         "top_k": top_k,
         "stream": stream,
+        "venus_options": {"recursive_reasoning": {"enabled": recursive}},
     }
 
 
@@ -222,6 +224,7 @@ def app_logic(
     max_tokens: int,
     top_p: float,
     top_k: int,
+    recursive: bool,
 ):
     messages = build_messages_from_chat(chat_history, system_prompt)
     image_b64: Optional[str] = None
@@ -244,6 +247,7 @@ def app_logic(
         max_tokens=max_tokens,
         top_p=top_p,
         top_k=top_k,
+        recursive=recursive,
     )
 
     if not stream:
@@ -260,34 +264,36 @@ def app_logic(
         return chat_history, gr.update(value=""), metrics_box
 
     # Streaming path: yield incremental updates to Chatbot
-    def stream_generator():
-        partial = ""
-        try:
-            gen = stream_chat(api_base, payload)
-            for piece in gen:
-                partial += piece
-                display = sanitize_assistant_text(partial)
-                yield chat_history + [(user_input, display)], ""
-            metrics: Metrics = gen.send(None)  # type: ignore[func-returns-value]
-        except StopIteration as stop:
-            metrics = stop.value  # type: ignore[assignment]
-        except Exception as e:
-            # Fallback to non-stream path if server doesn't support SSE
-            reply, metrics = non_stream_chat(api_base, payload)
-            reply = sanitize_assistant_text(reply)
-            metrics.note = f"fallback: {metrics.note or ''}".strip()
-            yield chat_history + [(user_input, reply)], ""
+    partial = ""
+    metrics = None
+    try:
+        gen = stream_chat(api_base, payload)
+        # Yield intermediate results for streaming
+        for piece in gen:
+            partial += piece
+            display = sanitize_assistant_text(partial)
+            yield chat_history + [(user_input, display)], "", f"Streaming token: {piece}"
+    except StopIteration as stop:
+        # Get metrics from generator's return value
+        metrics = stop.value
+    except Exception:
+        # Fallback to non-stream path if server doesn't support SSE
+        reply, metrics = non_stream_chat(api_base, payload)
+        partial = sanitize_assistant_text(reply)
+        metrics.note = f"fallback: {metrics.note or ''}".strip()
 
-        metrics_box = (
-            f"Latency: {metrics.latency_ms:.1f} ms\n"
-            f"Prompt tokens: {metrics.prompt_tokens}\n"
-            f"Completion tokens: {metrics.completion_tokens}\n"
-            f"Total tokens: {metrics.total_tokens}\n"
-            f"Tokens/sec: {metrics.tokens_per_second:.2f} ({metrics.note})"
-        )
-        yield chat_history + [(user_input, sanitize_assistant_text(partial))], "", metrics_box
+    if metrics is None:
+        metrics = Metrics(note="Stream ended without metrics.")
 
-    return stream_generator()
+    # Yield final result with metrics
+    metrics_box = (
+        f"Latency: {metrics.latency_ms:.1f} ms\n"
+        f"Prompt tokens: {metrics.prompt_tokens}\n"
+        f"Completion tokens: {metrics.completion_tokens}\n"
+        f"Total tokens: {metrics.total_tokens}\n"
+        f"Tokens/sec: {metrics.tokens_per_second:.2f} ({metrics.note})"
+    )
+    yield chat_history + [(user_input, sanitize_assistant_text(partial))], "", metrics_box
 
 
 def build_ui(default_api: str, launch_share: bool):
@@ -309,14 +315,19 @@ def build_ui(default_api: str, launch_share: bool):
                 top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="Top-p")
                 top_k = gr.Slider(1, 100, value=40, step=1, label="Top-k")
                 max_tokens = gr.Slider(16, 4096, value=512, step=16, label="Max new tokens")
-            stream = gr.Checkbox(value=False, label="Stream output")
-            fast_mode = gr.Checkbox(value=False, label="Fast mode (64 tokens, temp 0.2)")
+            with gr.Row():
+                stream = gr.Checkbox(value=False, label="Stream output")
+                fast_mode = gr.Checkbox(value=False, label="Fast mode (64 tokens, temp 0.2)")
+                recursive = gr.Checkbox(value=False, label="Recursive Reasoning")
             max_image_side = gr.Slider(256, 2048, value=640, step=64, label="Max image side (px)")
-            system_prompt = gr.Textbox(label="System Prompt", value="You are a helpful vision assistant.")
+            system_prompt = gr.Textbox(
+                label="System Prompt",
+                value="You are a helpful AI assistant.",
+            )
 
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(height=500)
+                chatbot = gr.Chatbot(height=500, type="messages")
                 with gr.Row():
                     user_input = gr.Textbox(placeholder="Ask about the image...", scale=4)
                     send_btn = gr.Button("Send", variant="primary", scale=1)
@@ -361,6 +372,7 @@ def build_ui(default_api: str, launch_share: bool):
                 max_tokens,
                 top_p,
                 top_k,
+                recursive,
             ],
             outputs=[chatbot, user_input, metrics_box],
         )
@@ -379,5 +391,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

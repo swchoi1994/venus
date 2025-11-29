@@ -1,0 +1,232 @@
+# EdgeFlow model configurations
+# This file defines three models:
+# 1) edgeflow-main-400m (hybrid SSM + windowed GQA attention)
+# 2) edgeflow-draft-120m (pure SSM for speculative drafting)
+# 3) edgeflow-verifier-30m (lightweight encoder for scoring)
+
+# ------------------------------------------------------------
+# 1. Main model: edgeflow-main-400m
+# ------------------------------------------------------------
+# Goal: Reasoning quality, stable generation, fast on Apple Silicon.
+# Runs with INT4 weights at inference. Hybrid architecture: SSM blocks
+# with periodic sliding-window GQA attention. Early-exit heads for short answers.
+---
+model:
+  name: edgeflow-main-400m
+  type: hybrid-ssm-gqa
+  vocab_size: 32000              # SentencePiece or BPE vocab
+  context_length: 4096           # sliding window hard cap
+  embedding_dim: 1536            # hidden size
+  num_layers: 32                 # total transformer-style blocks
+  rope_theta: 100000             # position scaling for attention blocks
+  norm: rmsnorm
+  activation: swiglu
+
+blocks:
+  pattern:
+    - ssm
+    - ssm
+    - ssm
+    - attn
+  ssm:
+    state_space_type: mamba2     # linear-time sequence update
+    state_dim: 192               # per-channel state size
+    conv_kernel: 4               # local conv for mixing
+    dropout: 0.0
+  attn:
+    kind: gqa                    # grouped-query attention
+    heads_total: 16
+    heads_kv: 4                  # shared key/value heads
+    window_size: 2048            # sliding window
+    kv_compression: lowrank      # project KV to lower rank
+    kv_rank: 64
+    dropout: 0.0
+  mlp:
+    hidden_multiplier: 2.5       # 1536 -> ~3840 -> 1536
+    gating: swiglu
+
+quantization:
+  target_precision: int4_weights_int8_act
+  group_size: 32                 # per-group scale for int4
+  qat: true                      # quant aware training
+  kv_cache_precision: int8
+  logits_dtype: fp16             # output head remains fp16/bf16
+  optimizer_dtype: bf16          # during finetune
+
+speculative_decode:
+  enabled: true
+  accept_min_prefix: 4           # accept at least 4-token prefix from draft
+  max_spec_tokens: 12            # draft proposes up to 12 tokens per step
+
+early_exit:
+  enabled: true
+  exit_layers: [6, 12, 18, 24]   # shallow heads for short answers
+  max_tokens_for_early_exit: 32  # use early head if answer is short
+
+training:
+  stage1_pretrain:
+    objective: next_token
+    lr_max: 3.0e-4
+    seq_len: 4096
+    batch_tokens: 2.0e6
+    epochs: 1
+    mix:
+      general_text: 0.5
+      code: 0.2
+      reasoning_traces_raw: 0.1
+      enterprise_docs: 0.2
+  stage2_distill_reasoning:
+    teacher_model: strong-teacher
+    supervise:
+      scratchpad_tokens: true
+      final_answer_tokens: true
+    lr_max: 1.0e-4
+    epochs: 0.5
+    max_chain_steps: 10
+  stage3_recursive_alignment:
+    self_play: true
+    recursion_depth: 2
+    beam_width: 2
+    lr_max: 5.0e-5
+    epochs: 0.25
+  stage4_qat:
+    int8_warmup_steps: 2000
+    int4_final_steps: 5000
+    lr_max: 1.0e-5
+
+runtime:
+  backend_targets:
+    - apple_silicon_cpu
+    - apple_silicon_ne
+    - arm_neon
+    - arm_sve
+  math_kernels:
+    matmul: accelerate            # Apple Accelerate / BLAS
+    ssm_step: custom_arm_kernel   # fused state update
+    attn_windowed: fused_int4     # int4 * int8 -> fp16 accumulate
+  batching:
+    in_flight_batching: true
+    max_concurrent_requests: 32
+  thread_pinning:
+    enabled: true
+    performance_cores_only: true
+
+# Why these values
+# - 400M class fits INT4 across common devices.
+# - 1536 x 32 layers lands ~400–600M depending on heads/MLP width.
+# - Periodic GQA attention restores local reasoning and formatting quality.
+# - GQA reduces KV cache footprint for CPU-friendly decode.
+
+
+# ------------------------------------------------------------
+# 2. Draft model: edgeflow-draft-120m
+# ------------------------------------------------------------
+# Goal: Predict tokens fast and propose multi-token chunks.
+# Architecture: pure SSM stack (no attention), linear-time.
+---
+model:
+  name: edgeflow-draft-120m
+  type: ssm-only
+  vocab_size: 32000
+  context_length: 2048
+  embedding_dim: 768
+  num_layers: 24
+  norm: rmsnorm
+  activation: swiglu
+
+ssm_block:
+  state_space_type: mamba2
+  state_dim: 128
+  conv_kernel: 4
+  dropout: 0.0
+
+mlp:
+  hidden_multiplier: 2.0
+
+quantization:
+  target_precision: int8_weights_int8_act
+  group_size: 64
+  qat: true
+
+speculative_role:
+  propose_tokens: 12        # try to draft 12 tokens at a time
+  min_keep_ratio: 0.5       # if main model rejects >50%, lower to 6
+
+training:
+  objective: next_token
+  teacher_forcing: true
+  temperature_distill: 1.5   # soften teacher logits for smooth targets
+  data_share:
+    general_text: 0.6
+    code: 0.15
+    enterprise_docs: 0.25
+
+runtime:
+  backend_targets:
+    - apple_silicon_cpu
+    - arm_neon
+  thread_pinning:
+    enabled: true
+
+# Why this matters
+# - Cheap to step; used on every decode iteration.
+# - Main model verifies/accepts spans; heavy forwards are amortized.
+
+
+# ------------------------------------------------------------
+# 3. Verifier model: edgeflow-verifier-30m
+# ------------------------------------------------------------
+# Goal: Score candidate answers for quality, math validity, JSON well-formedness,
+# and safety. Used for recursion control and beam selection. Classification only.
+---
+model:
+  name: edgeflow-verifier-30m
+  type: encoder-lite
+  vocab_size: 32000
+  context_length: 1024
+  embedding_dim: 512
+  num_layers: 12
+  norm: layernorm
+  activation: gelu
+
+heads:
+  tasks:
+    - name: answer_quality
+      type: binary
+    - name: math_validity
+      type: binary
+    - name: json_well_formed
+      type: binary
+    - name: safety_block
+      type: binary
+
+quantization:
+  target_precision: int8_full
+  qat: true
+
+training:
+  labels:
+    answer_quality: good / bad from teacher comparisons
+    math_validity: exact match vs teacher math steps
+    json_well_formed: passes json.loads
+    safety_block: policy tag
+  loss:
+    weighted_binary_cross_entropy: true
+  batch_size: "2048 samples"
+  lr_max: 5.0e-4
+  epochs: 1.0
+
+runtime:
+  backend_targets:
+    - apple_silicon_cpu
+    - arm_neon
+  latency_budget_ms: 2
+
+# Why this matters
+# - Enables controlled recursion and early stopping when confidence is high.
+# - Supports beam_width 2 selection without heavy re-scoring.
+
+
+
+
+

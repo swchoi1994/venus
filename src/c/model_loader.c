@@ -1,7 +1,12 @@
 #include "model_loader.h"
+#include "utils/json_helper.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // GGUF format constants
 #define GGUF_MAGIC 0x46554747  // "GGUF"
@@ -76,155 +81,166 @@ ModelData* load_model(const char* path) {
 }
 
 ModelData* load_venus_model(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) {
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
         printf("Failed to open file: %s\n", path);
         return NULL;
     }
-    
+
+    struct stat sb;
+    if (fstat(fd, &sb) == -1) {
+        close(fd);
+        printf("Failed to stat file: %s\n", path);
+        return NULL;
+    }
+
+    size_t file_size = sb.st_size;
+    void* mapped_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (mapped_data == MAP_FAILED) {
+        printf("Failed to mmap file: %s\n", path);
+        return NULL;
+    }
+
     ModelData* model = calloc(1, sizeof(ModelData));
     if (!model) {
-        fclose(f);
+        munmap(mapped_data, file_size);
         return NULL;
     }
     
     model->format = FORMAT_VENUS;
-    
-    // Read magic
-    char magic[4];
-    fread(magic, 1, 4, f);
+    model->mapped_addr = mapped_data; // Store original mapped address
+    model->mapped_size = file_size;
+    model->data = mapped_data;
+    model->data_size = file_size;
+
+    char* current_ptr = (char*)mapped_data;
+
+    // Check magic number
+    if (memcmp(current_ptr, VENUS_MAGIC, 4) != 0) {
+        printf("Invalid Venus magic number\n");
+        free_model_data(model);
+        return NULL;
+    }
+    current_ptr += 4;
     
     // Read header size
-    uint32_t header_size;
-    fread(&header_size, sizeof(uint32_t), 1, f);
+    uint32_t header_size = *(uint32_t*)current_ptr;
+    current_ptr += sizeof(uint32_t);
     
     // Read header JSON
     model->metadata_json = malloc(header_size + 1);
-    fread(model->metadata_json, 1, header_size, f);
+    memcpy(model->metadata_json, current_ptr, header_size);
     model->metadata_json[header_size] = '\0';
+    current_ptr += header_size;
     
     // Parse header to fill ModelConfig
-    // TODO: Use a proper JSON parser
-    // For now, we'll set some defaults
-    model->config.vocab_size = 32000;
-    model->config.hidden_dim = 4096;
-    model->config.n_layers = 32;
-    model->config.n_heads = 32;
-    model->config.n_kv_heads = 32;
-    model->config.seq_len = 2048;
-    model->config.intermediate_size = 11008;
-    model->config.rope_theta = 10000.0f;
-    model->config.layer_norm_eps = 1e-6f;
+    const char* json = model->metadata_json;
+    model->config.vocab_size = json_get_int(json, "vocab_size", 32000);
+    model->config.hidden_dim = json_get_int(json, "hidden_size", 4096);
+    model->config.n_layers = json_get_int(json, "num_layers", 32);
+    model->config.n_heads = json_get_int(json, "num_heads", 32);
+    model->config.n_kv_heads = json_get_int(json, "num_kv_heads", 32);
+    model->config.seq_len = json_get_int(json, "max_position_embeddings", 2048);
+    model->config.intermediate_size = json_get_int(json, "intermediate_size", 11008);
+    model->config.rope_theta = json_get_float(json, "rope_theta", 10000.0f);
+    model->config.layer_norm_eps = json_get_float(json, "layer_norm_eps", 1e-6f);
+    model->config.use_gqa = json_get_bool(json, "use_gqa", false);
+    model->config.use_rope = json_get_bool(json, "use_rope", true);
+    
+    // VLM config parsing
+    model->config.is_vision_model = json_get_bool(json, "is_vision_model", false);
+    if (model->config.is_vision_model) {
+        // A real implementation would parse the nested "vision_config" object.
+        // This is a simplified stand-in.
+        model->config.vision_config.hidden_size = json_get_int(json, "hidden_size", 1024);
+        model->config.vision_config.image_size = json_get_int(json, "image_size", 336);
+        model->config.vision_config.patch_size = json_get_int(json, "patch_size", 14);
+        model->config.vision_config.num_hidden_layers = json_get_int(json, "num_hidden_layers", 24);
+        model->config.vision_config.num_attention_heads = json_get_int(json, "num_attention_heads", 16);
+        model->config.vision_config.intermediate_size = json_get_int(json, "intermediate_size", 4096);
+    }
+
+    // TODO: Parse architecture string and map to enum
     model->config.architecture = ARCH_LLAMA;
-    model->config.use_gqa = false;
     model->config.use_flash_attention = true;
-    model->config.use_rope = true;
     model->config.use_alibi = false;
     model->config.is_encoder_decoder = false;
     
     // Read number of tensors
-    uint32_t n_tensors;
-    fread(&n_tensors, sizeof(uint32_t), 1, f);
+    uint32_t n_tensors = *(uint32_t*)current_ptr;
+    current_ptr += sizeof(uint32_t);
     model->n_tensors = n_tensors;
     
     model->tensors = calloc(n_tensors, sizeof(TensorInfo));
     
-    // Calculate total data size
-    size_t total_data_size = 0;
-    
-    // Read tensor info
+    // The start of the tensor weight data, right after all tensor headers
+    char* weights_ptr_start = current_ptr;
+    // First, we need to calculate the total size of all tensor headers to find where the weights data begins.
+    for (size_t i = 0; i < n_tensors; i++) {
+        uint32_t name_len = *(uint32_t*)weights_ptr_start;
+        weights_ptr_start += sizeof(uint32_t) + name_len;
+
+        uint32_t quant_len = *(uint32_t*)weights_ptr_start;
+        weights_ptr_start += sizeof(uint32_t) + quant_len;
+
+        uint32_t n_dims = *(uint32_t*)weights_ptr_start;
+        weights_ptr_start += sizeof(uint32_t) + (n_dims * sizeof(uint32_t));
+
+        weights_ptr_start += sizeof(float); // scale
+        weights_ptr_start += sizeof(uint64_t); // data_size
+    }
+
+
+    // Read tensor info, offsets are relative to the start of the weights data
+    size_t current_offset = 0;
     for (size_t i = 0; i < n_tensors; i++) {
         TensorInfo* tensor = &model->tensors[i];
         
-        // Read name
-        uint32_t name_len;
-        fread(&name_len, sizeof(uint32_t), 1, f);
+        uint32_t name_len = *(uint32_t*)current_ptr;
+        current_ptr += sizeof(uint32_t);
         tensor->name = malloc(name_len + 1);
-        fread(tensor->name, 1, name_len, f);
+        memcpy(tensor->name, current_ptr, name_len);
         tensor->name[name_len] = '\0';
+        current_ptr += name_len;
         
-        // Read quantization type
-        uint32_t quant_len;
-        fread(&quant_len, sizeof(uint32_t), 1, f);
+        uint32_t quant_len = *(uint32_t*)current_ptr;
+        current_ptr += sizeof(uint32_t);
         char* quant_type = malloc(quant_len + 1);
-        fread(quant_type, 1, quant_len, f);
+        memcpy(quant_type, current_ptr, quant_len);
         quant_type[quant_len] = '\0';
+        current_ptr += quant_len;
         
-        // Set dtype based on quantization
-        if (strcmp(quant_type, "none") == 0) {
-            tensor->dtype = DTYPE_F32;
-        } else if (strcmp(quant_type, "q8_0") == 0) {
-            tensor->dtype = DTYPE_INT8;
-        } else if (strcmp(quant_type, "q4_0") == 0) {
-            tensor->dtype = DTYPE_INT4;
-        }
+        if (strcmp(quant_type, "none") == 0) tensor->dtype = DTYPE_F32;
+        else if (strcmp(quant_type, "q8_0") == 0) tensor->dtype = DTYPE_INT8;
+        else if (strcmp(quant_type, "q4_0") == 0) tensor->dtype = DTYPE_INT4;
         free(quant_type);
         
-        // Read shape
-        fread(&tensor->n_dims, sizeof(uint32_t), 1, f);
-        for (uint32_t j = 0; j < tensor->n_dims; j++) {
-            fread(&tensor->shape[j], sizeof(uint32_t), 1, f);
-        }
+        tensor->n_dims = *(uint32_t*)current_ptr;
+        current_ptr += sizeof(uint32_t);
+        memcpy(tensor->shape, current_ptr, tensor->n_dims * sizeof(uint32_t));
+        current_ptr += tensor->n_dims * sizeof(uint32_t);
         
-        // Read scale
-        fread(&tensor->scale, sizeof(float), 1, f);
+        tensor->scale = *(float*)current_ptr;
+        current_ptr += sizeof(float);
         
-        // Read data size
-        uint64_t data_size;
-        fread(&data_size, sizeof(uint64_t), 1, f);
+        uint64_t data_size = *(uint64_t*)current_ptr;
+        current_ptr += sizeof(uint64_t);
         tensor->size = data_size;
         
-        // Set offset (will be updated when we allocate data)
-        tensor->offset = total_data_size;
-        total_data_size += data_size;
-        
-        // Skip the actual data for now
-        fseek(f, data_size, SEEK_CUR);
+        tensor->offset = current_offset;
+        current_offset += data_size;
     }
+
+    // With mmap, the tensor data is already "loaded". We just need to point to it.
+    // The `data` pointer in ModelData now points to the beginning of the mmap'd file.
+    // We adjust it to point to the beginning of the *weights* section.
+    model->data = weights_ptr_start;
+    model->data_size = file_size - (weights_ptr_start - (char*)mapped_data); // Size of the weights section
     
-    // Allocate memory for all tensor data
-    model->data_size = total_data_size;
-    model->data = malloc(total_data_size);
-    if (!model->data) {
-        free_model_data(model);
-        fclose(f);
-        return NULL;
-    }
-    
-    // Re-read file to load actual tensor data
-    fseek(f, 4 + sizeof(uint32_t) + header_size + sizeof(uint32_t), SEEK_SET);
-    
-    // Skip tensor headers and load data
-    for (size_t i = 0; i < n_tensors; i++) {
-        TensorInfo* tensor = &model->tensors[i];
-        
-        // Skip header info we already read
-        uint32_t name_len;
-        fread(&name_len, sizeof(uint32_t), 1, f);
-        fseek(f, name_len, SEEK_CUR);
-        
-        uint32_t quant_len;
-        fread(&quant_len, sizeof(uint32_t), 1, f);
-        fseek(f, quant_len, SEEK_CUR);
-        
-        uint32_t n_dims;
-        fread(&n_dims, sizeof(uint32_t), 1, f);
-        fseek(f, n_dims * sizeof(uint32_t), SEEK_CUR);
-        
-        float scale;
-        fread(&scale, sizeof(float), 1, f);
-        
-        uint64_t data_size;
-        fread(&data_size, sizeof(uint64_t), 1, f);
-        
-        // Read actual data
-        fread((char*)model->data + tensor->offset, 1, tensor->size, f);
-    }
-    
-    fclose(f);
-    
-    printf("Loaded Venus model: %zu tensors, %.2f MB\n", 
-           model->n_tensors, model->data_size / 1024.0 / 1024.0);
+    printf("Loaded Venus model (mmap): %zu tensors, %.2f MB\n", 
+           model->n_tensors, file_size / 1024.0 / 1024.0);
     
     return model;
 }
@@ -333,7 +349,12 @@ void free_model_data(ModelData* data) {
         free(data->tensors);
     }
     
-    free(data->data);
+    if (data->format == FORMAT_VENUS && data->mapped_addr) {
+        munmap(data->mapped_addr, data->mapped_size);
+    } else {
+        free(data->data);
+    }
+    
     free(data->metadata_json);
     free(data);
 }

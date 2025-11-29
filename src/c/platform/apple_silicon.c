@@ -9,6 +9,10 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
+// Forward declare metal gemm
+void metal_gemm_f32(const float* a, const float* b, float* c,
+                          int m, int n, int k, float alpha, float beta);
+
 // Apple Silicon specific SIMD operations
 
 static void apple_vec_add_f32(const float* a, const float* b, float* c, size_t n) {
@@ -31,7 +35,8 @@ static float apple_vec_dot_f32(const float* a, const float* b, size_t n) {
 
 static void apple_gemm_f32(const float* a, const float* b, float* c,
                           int m, int n, int k, float alpha, float beta) {
-    // Use Accelerate's BLAS
+    // This function will be dynamically replaced if Metal is enabled.
+    // Default to Accelerate's BLAS.
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 m, n, k, alpha, a, k, b, n, beta, c, n);
 }
@@ -123,7 +128,7 @@ static SimdOps apple_simd_ops = {
     .vec_mul_f32 = apple_vec_mul_f32,
     .vec_scale_f32 = apple_vec_scale_f32,
     .vec_dot_f32 = apple_vec_dot_f32,
-    .gemm_f32 = apple_gemm_f32,
+    .gemm_f32 = apple_gemm_f32, // Default to CPU GEMM
     .gemv_f32 = apple_gemv_f32,
     .gelu_f32 = apple_gelu_f32,
     .silu_f32 = apple_silu_f32,
@@ -161,7 +166,16 @@ PlatformInfo* get_apple_silicon_info(void) {
 
 void init_apple_silicon(void) {
     printf("Initialized Apple Silicon optimizations\n");
-    printf("Using Accelerate framework for BLAS operations\n");
+    
+    // Check if Metal should be used for GEMM
+    char* use_metal_env = getenv("VENUS_USE_METAL");
+    if (use_metal_env && strcmp(use_metal_env, "1") == 0) {
+        printf("Using Metal for GEMM operations\n");
+        apple_simd_ops.gemm_f32 = metal_gemm_f32;
+    } else {
+        printf("Using Accelerate framework for BLAS operations\n");
+        apple_simd_ops.gemm_f32 = apple_gemm_f32;
+    }
 }
 
 void cleanup_apple_silicon(void) {

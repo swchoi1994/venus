@@ -14,6 +14,23 @@ extern "C" {
 #define VENUS_VERSION_MINOR 1
 #define VENUS_VERSION_PATCH 0
 
+// Vision model configuration
+typedef struct {
+    int hidden_size;
+    int intermediate_size;
+    int num_hidden_layers;
+    int num_attention_heads;
+    int image_size;
+    int patch_size;
+} VisionConfig;
+
+// Projector configuration
+typedef struct {
+    int hidden_size;
+    int intermediate_size;
+} ProjectorConfig;
+
+
 // Model configuration
 typedef struct {
     int vocab_size;
@@ -40,6 +57,11 @@ typedef struct {
     int bos_token_id;
     int eos_token_id;
     int pad_token_id;
+    
+    // VLM specific configurations
+    bool is_vision_model;
+    VisionConfig vision_config;
+    ProjectorConfig projector_config;
     
     // Architecture type - supports all vLLM architectures
     enum {

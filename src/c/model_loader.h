@@ -30,6 +30,8 @@ typedef struct {
     size_t n_tensors;
     void* data;
     size_t data_size;
+    void* mapped_addr; // Original address from mmap
+    size_t mapped_size; // Original size from mmap
     char* metadata_json;
 } ModelData;
 

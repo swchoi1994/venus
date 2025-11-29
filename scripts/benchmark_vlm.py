@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Benchmark EdgeFlow VLM inference versus a Hugging Face baseline.
+Benchmark Venus VLM inference versus a Hugging Face baseline.
 
 Example:
     python scripts/benchmark_vlm.py \
-        --edgeflow http://localhost:8000 \
-        --baseline qwen/Qwen2-VL-4B-Instruct \
+        --venus http://localhost:8000 \
+        --model qwen3-vl-8b \
+        --baseline Qwen/Qwen2-VL-7B-Instruct \
         --prompt "Describe the image in detail." \
         --image ./sample.jpg
 """
@@ -37,9 +38,10 @@ def encode_image(path: Path) -> str:
     return base64.b64encode(data).decode("utf-8")
 
 
-def edgeflow_payload(
+def venus_payload(
     prompt: str,
     image_data: str,
+    model: str,
     *,
     recursive: bool = False,
     max_depth: int = 3,
@@ -49,7 +51,7 @@ def edgeflow_payload(
     vlm_max_side: int | None = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
-        "model": "qwen3-vl-4b",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -81,10 +83,11 @@ def edgeflow_payload(
     return payload
 
 
-def run_edgeflow(
+def run_venus(
     url: str,
     prompt: str,
     image: Path,
+    model: str,
     warmup: int,
     runs: int,
     *,
@@ -96,9 +99,10 @@ def run_edgeflow(
     vlm_max_side: int | None = None,
 ) -> Dict[str, Any]:
     image_data = encode_image(image)
-    payload = edgeflow_payload(
+    payload = venus_payload(
         prompt,
         image_data,
+        model=model,
         recursive=recursive,
         max_depth=max_depth,
         beam_width=beam_width,

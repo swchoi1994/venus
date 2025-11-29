@@ -1,14 +1,18 @@
-from setuptools import setup, find_packages, Extension
-from setuptools.command.build_ext import build_ext
+from setuptools import setup, find_packages
+from setuptools.command.build_py import build_py
 import subprocess
 import os
 import sys
 
-class CMakeBuild(build_ext):
+class BuildPyCommand(build_py):
+    """Custom build command to build C library first."""
     def run(self):
-        # Build C library first
-        subprocess.check_call(['make', 'clean'])
-        subprocess.check_call(['make', '-j4'])
+        # Build C library
+        print("Building C library before packaging...")
+        if subprocess.call(['make', 'clean']) != 0:
+            raise RuntimeError("make clean failed")
+        if subprocess.call(['make', '-j4']) != 0:
+            raise RuntimeError("make failed")
         super().run()
 
 setup(
@@ -19,11 +23,12 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/venus",
-    packages=find_packages(where="src"),
-    package_dir={"": "src"},
+    packages=find_packages(where="src/python"),
+    package_dir={"": "src/python"},
     package_data={
-        "": ["*.so", "*.dylib", "*.dll"],
+        "venus": ["../libvenus.so", "../libvenus.dylib", "../venus.dll"],
     },
+    include_package_data=True,
     install_requires=[
         "fastapi>=0.104.0",
         "uvicorn[standard]>=0.24.0",
@@ -55,7 +60,6 @@ setup(
     },
     python_requires=">=3.8",
     cmdclass={
-        "build_ext": CMakeBuild,
+        'build_py': BuildPyCommand,
     },
-    ext_modules=[Extension("venus._c_lib", [])],  # Dummy extension to trigger build
 )

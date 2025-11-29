@@ -18,6 +18,7 @@ from pathlib import Path
 import base64
 import io
 import hashlib
+from contextlib import contextmanager
 
 try:
     import torch  # type: ignore
@@ -31,6 +32,84 @@ MODEL_DIR = Path(os.environ.get("VENUS_MODEL_DIR", "./models")).resolve()
 manifest_models: Dict[str, Dict[str, Any]] = {}
 default_model_name: Optional[str] = None
 MAX_IMAGE_SIDE = int(os.environ.get("VLM_MAX_IMAGE_SIDE", "640"))
+TORCH_COMPILE_POLICY = os.environ.get("VENUS_TORCH_COMPILE", "").strip().lower()
+DISABLE_WARMUP = os.environ.get("VENUS_DISABLE_WARMUP", "").strip().lower() in {"1", "true", "yes"}
+
+
+def configure_torch_runtime() -> None:
+    if not TRANSFORMERS_AVAILABLE:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.set_float32_matmul_precision("high")
+        threads_env = os.environ.get("VENUS_TORCH_THREADS")
+        if threads_env:
+            threads = max(1, int(threads_env))
+            torch.set_num_threads(threads)
+            if hasattr(torch, "set_num_interop_threads"):
+                torch.set_num_interop_threads(max(1, min(threads, os.cpu_count() or threads)))
+    except Exception as exc:  # pragma: no cover - best effort tuning
+        print(f"[startup] torch runtime tuning skipped: {exc}")
+
+
+def _select_attn_implementation() -> Optional[str]:
+    if not TRANSFORMERS_AVAILABLE:
+        return None
+    impl = "sdpa"
+    try:
+        from transformers.utils import is_flash_attn_2_available  # type: ignore
+
+        if torch.cuda.is_available() and is_flash_attn_2_available():
+            impl = "flash_attention_2"
+    except Exception:
+        pass
+    return impl
+
+
+def _should_compile_model() -> bool:
+    if not TRANSFORMERS_AVAILABLE or not hasattr(torch, "compile"):
+        return False
+    if TORCH_COMPILE_POLICY in {"0", "false", "no", "off"}:
+        return False
+    if TORCH_COMPILE_POLICY in {"1", "true", "yes", "on"}:
+        return True
+    # Default: enable when CUDA available
+    return TORCH_COMPILE_POLICY == "auto" and torch.cuda.is_available()
+
+
+def _maybe_compile_model(model: "torch.nn.Module", label: str) -> "torch.nn.Module":
+    if not _should_compile_model():
+        return model
+    try:
+        compiled = torch.compile(model, mode="reduce-overhead", fullgraph=False)  # type: ignore[arg-type]
+        print(f"[startup] torch.compile enabled for {label}")
+        return compiled
+    except Exception as exc:
+        print(f"[startup] torch.compile disabled for {label}: {exc}")
+        return model
+
+
+@contextmanager
+def _inference_context(device: "torch.device", dtype: "torch.dtype"):
+    if not TRANSFORMERS_AVAILABLE:
+        yield
+        return
+    with torch.inference_mode():
+        if device.type == "cuda":
+            target_dtype = torch.float16 if dtype == torch.float16 else torch.bfloat16
+            with torch.autocast("cuda", dtype=target_dtype):
+                yield
+        elif device.type == "mps":
+            with torch.autocast("mps", dtype=torch.float16):
+                yield
+        else:
+            yield
+
+
+configure_torch_runtime()
 
 # Load the C library
 def load_venus_library():
@@ -163,6 +242,7 @@ class EngineManager:
     def __init__(self):
         self.engines = {}
         self.vlm_engines = {}
+        self.hf_text_engines = {}
     
     def load_model(self, model_name: str, model_path: str, tokenizer_path: Optional[str] = None):
         try:
@@ -174,16 +254,28 @@ class EngineManager:
         return self.engines.get(model_name)
     
     def list_models(self) -> List[str]:
-        return list(self.engines.keys()) + list(self.vlm_engines.keys())
+        return list(self.engines.keys()) + list(self.vlm_engines.keys()) + list(self.hf_text_engines.keys())
 
     # HF VLM engines
     def load_vlm_model(self, model_name: str, model_dir: str):
         if not TRANSFORMERS_AVAILABLE:
             raise RuntimeError("transformers/Pillow not available to load VLM model")
-        self.vlm_engines[model_name] = HFVLMEngine(model_dir)
+        try:
+            self.vlm_engines[model_name] = HFVLMEngine(model_dir)
+        except ImportError:
+            # Fallback to CausalLM for VLM models that might be text-only
+            self.load_hf_text_model(model_name, model_dir)
 
     def get_vlm_engine(self, model_name: str):
         return self.vlm_engines.get(model_name)
+
+    def load_hf_text_model(self, model_name: str, model_dir: str):
+        if not TRANSFORMERS_AVAILABLE:
+            raise RuntimeError("transformers not available")
+        self.hf_text_engines[model_name] = HFTxtEngine(model_dir)
+
+    def get_hf_text_engine(self, model_name: str):
+        return self.hf_text_engines.get(model_name)
 
 
 def resolve_artifact_path(base_dir: Path, artifact_path: Optional[str]) -> Optional[Path]:
@@ -243,7 +335,22 @@ def load_models_from_manifest(model_dir: Path) -> bool:
                 print(f"[startup] failed to load VLM model {model_name}: {exc}")
             continue
 
-        # Default LLM via Venus C engine
+        # LLM: prefer HF text if hf_model_dir is present; otherwise Venus C engine
+        hf_txt_dir = cfg.get("hf_model_dir")
+        if hf_txt_dir:
+            hf_txt_path = resolve_artifact_path(model_dir, hf_txt_dir)
+            if not hf_txt_path or not hf_txt_path.exists():
+                print(f"[startup] skipping {model_name}: hf_model_dir {hf_txt_path} not found")
+                continue
+            try:
+                engine_manager.load_hf_text_model(model_name, str(hf_txt_path))
+                loaded_models[model_name] = dict(cfg)
+                loaded_any = True
+                print(f"[startup] loaded HF text LLM {model_name} from {hf_txt_path}")
+            except Exception as exc:
+                print(f"[startup] failed to load HF text LLM {model_name}: {exc}")
+            continue
+
         model_path = resolve_artifact_path(model_dir, cfg.get("model_path"))
         tokenizer_path = resolve_artifact_path(model_dir, cfg.get("tokenizer_path"))
 
@@ -418,12 +525,11 @@ async def chat_completions(request: ChatCompletionRequest):
             usage=usage,
         )
 
-    # Otherwise, use Venus C engine
+    # Otherwise, try HF text engine, then Venus C engine
+    hf_text_engine = engine_manager.get_hf_text_engine(request.model)
     engine = engine_manager.get_engine(request.model)
-    if not engine:
+    if not hf_text_engine and not engine:
         raise HTTPException(status_code=404, detail=f"Model {request.model} not found")
-
-    prompt = format_chat_prompt(request.messages)
 
     config = GenerationConfig(
         temperature=request.temperature,
@@ -435,12 +541,6 @@ async def chat_completions(request: ChatCompletionRequest):
         presence_penalty=request.presence_penalty,
         frequency_penalty=request.frequency_penalty,
     )
-
-    if request.stream:
-        return StreamingResponse(
-            generate_stream(engine, prompt, config, request.model),
-            media_type="text/event-stream"
-        )
 
     # Inspect BitNet config and surface a notice for now (no accelerated kernels yet)
     model_cfg = manifest_models.get(request.model, {})
@@ -459,26 +559,69 @@ async def chat_completions(request: ChatCompletionRequest):
     elif isinstance(model_cfg.get("recursive_reasoning"), dict):
         rec_cfg = model_cfg.get("recursive_reasoning")
 
-    if rec_cfg and rec_cfg.get("enabled") and not request.stream:
-        max_depth = int(rec_cfg.get("max_depth", 3))
-        beam_width = int(rec_cfg.get("beam_width", 1))
-        # Build working scratchpad from chat
-        working_prompt = prompt
-        best_text = ""
-        for _ in range(max_depth):
-            candidates: List[str] = []
-            for _b in range(max(1, beam_width)):
-                t = engine.generate(working_prompt, config)
-                candidates.append(t)
-            # Select the longest candidate as a simple heuristic
-            best_text = max(candidates, key=lambda x: len(x) if x else 0)
-            # Append to scratchpad
-            working_prompt = working_prompt + f"\nassistant: {best_text}"
-        response_text = best_text
+    response_text: str
+    prompt_tokens: int
+    completion_tokens: int
+
+    if hf_text_engine:
+        # Hugging Face text engine path (uses message list)
+        if rec_cfg and rec_cfg.get("enabled") and not request.stream:
+            max_depth = int(rec_cfg.get("max_depth", 3))
+            beam_width = int(rec_cfg.get("beam_width", 1))
+            working_messages: List[ChatMessage] = list(request.messages)
+            best_text: str = ""
+            for _ in range(max_depth):
+                candidates: List[str] = []
+                for _b in range(max(1, beam_width)):
+                    t = hf_text_engine.generate(working_messages, config)
+                    candidates.append(t)
+                best_text = max(candidates, key=lambda x: len(x) if x else 0)
+                working_messages.append(ChatMessage(role="assistant", content=best_text))
+            response_text = best_text
+        else:
+            response_text = hf_text_engine.generate(request.messages, config)
+        
+        prompt_text = hf_text_engine.tokenizer.apply_chat_template(
+            [{"role": m.role, "content": m.content} for m in request.messages],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_tokens = hf_text_engine.count_tokens(prompt_text)
+        completion_tokens = hf_text_engine.count_tokens(response_text)
+    
+    elif engine: # Venus C engine path (uses prompt string)
+        prompt = format_chat_prompt(request.messages)
+
+        if request.stream:
+            return StreamingResponse(
+                generate_stream(engine, prompt, config, request.model),
+                media_type="text/event-stream"
+            )
+
+        def _generate_once_llm(p: str) -> str:
+            return engine.generate(p, config)
+
+        if rec_cfg and rec_cfg.get("enabled"):
+            max_depth = int(rec_cfg.get("max_depth", 3))
+            beam_width = int(rec_cfg.get("beam_width", 1))
+            working_prompt = prompt
+            best_text = ""
+            for _ in range(max_depth):
+                candidates: List[str] = []
+                for _b in range(max(1, beam_width)):
+                    t = _generate_once_llm(working_prompt)
+                    candidates.append(t)
+                best_text = max(candidates, key=lambda x: len(x) if x else 0)
+                working_prompt = working_prompt + f"\nassistant: {best_text}"
+            response_text = best_text
+        else:
+            response_text = _generate_once_llm(prompt)
+        
+        prompt_tokens = engine.count_tokens(prompt)
+        completion_tokens = engine.count_tokens(response_text)
     else:
-        response_text = engine.generate(prompt, config)
-    prompt_tokens = engine.count_tokens(prompt)
-    completion_tokens = engine.count_tokens(response_text)
+        raise HTTPException(status_code=500, detail="No valid engine found for model")
+
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4()}",
@@ -544,6 +687,8 @@ class HFVLMEngine:
         if not TRANSFORMERS_AVAILABLE:
             raise RuntimeError("transformers not available")
         self.processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+        self._attn_impl = _select_attn_implementation()
+        self._model_label = f"vlm:{Path(model_dir).name}"
         # Select device and dtype for speed
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -554,24 +699,27 @@ class HFVLMEngine:
         else:
             self.device = torch.device("cpu")
             dtype = torch.float32
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_dir, torch_dtype=dtype, trust_remote_code=True
+        base_model = AutoModelForVision2Seq.from_pretrained(
+            model_dir,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            attn_implementation=self._attn_impl,
         ).to(self.device)
+        # Prefer channels_last for image-heavy workloads where supported
+        try:
+            base_model = base_model.to(memory_format=torch.channels_last)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        self.dtype = next(base_model.parameters()).dtype
+        self.model = _maybe_compile_model(base_model, self._model_label)
         self.model.eval()
         self._image_cache: Dict[str, Image.Image] = {}
         # Cache of resized images keyed by (sha1, side_cap)
         self._resized_cache: Dict[str, Dict[int, Image.Image]] = {}
-        # Prefer channels_last for MPS speedups
-        try:
-            self.model = self.model.to(memory_format=torch.channels_last)  # type: ignore[arg-type]
-        except Exception:
-            pass
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
 
     def generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any], *, max_image_side: Optional[int] = None):
+        t0 = time.perf_counter()
         # Build chat with image placeholders using apply_chat_template
         chat: List[Dict[str, Any]] = []
         for m in messages:
@@ -589,6 +737,8 @@ class HFVLMEngine:
         prompt_text = self.processor.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True
         )
+        t1 = time.perf_counter()
+        print(f"[TIMER] apply_chat_template: {(t1 - t0) * 1000:.2f} ms")
 
         images, hashes = extract_images_and_hashes(messages)
         # Cache decoded PIL to avoid repeated decode cost across turns
@@ -623,16 +773,25 @@ class HFVLMEngine:
             if h not in self._resized_cache:
                 self._resized_cache[h] = {}
             self._resized_cache[h][side_cap] = rimg
+        t2 = time.perf_counter()
+        print(f"[TIMER] image processing: {(t2 - t1) * 1000:.2f} ms")
 
         inputs = self.processor(text=prompt_text, images=(resized or None), return_tensors="pt")
+        t3 = time.perf_counter()
+        print(f"[TIMER] processor call: {(t3 - t2) * 1000:.2f} ms")
         try:
-            inputs = inputs.to(self.device)  # type: ignore[attr-defined]
+            inputs = inputs.to(self.device, self.dtype)  # type: ignore[attr-defined]
         except Exception:
             # Manually move tensors if BatchFeature doesn't expose .to()
             for k, v in list(inputs.items()):
                 if hasattr(v, "to"):
-                    inputs[k] = v.to(self.device)
-        with torch.no_grad():
+                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                        inputs[k] = v.to(self.device, dtype=self.dtype)
+                    else:
+                        inputs[k] = v.to(self.device)
+        t4 = time.perf_counter()
+        print(f"[TIMER] inputs.to(device): {(t4 - t3) * 1000:.2f} ms")
+        with _inference_context(self.device, self.dtype):
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=int(gen_cfg.get("max_tokens", 256)),
@@ -640,6 +799,8 @@ class HFVLMEngine:
                 temperature=float(gen_cfg.get("temperature", 0.7)),
                 top_p=float(gen_cfg.get("top_p", 0.9)),
             )
+        t5 = time.perf_counter()
+        print(f"[TIMER] model.generate: {(t5 - t4) * 1000:.2f} ms")
         text = self.processor.batch_decode(output, skip_special_tokens=True)[0]
         # Heuristic: strip echoed prompt
         if text.startswith(prompt_text):
@@ -655,9 +816,12 @@ class HFVLMEngine:
             "completion_tokens": len(text.split()),
             "total_tokens": ptoks + len(text.split()),
         }
+        t6 = time.perf_counter()
+        print(f"[TIMER] decode and usage: {(t6 - t5) * 1000:.2f} ms")
         return text, usage
 
     async def stream_generate(self, messages: List[ChatMessage], gen_cfg: Dict[str, Any], *, max_image_side: Optional[int] = None):
+        t0 = time.perf_counter()
         chat: List[Dict[str, Any]] = []
         for m in messages:
             content_items: List[Dict[str, Any]] = []
@@ -674,6 +838,8 @@ class HFVLMEngine:
         prompt_text = self.processor.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True
         )
+        t1 = time.perf_counter()
+        print(f"[TIMER] stream apply_chat_template: {(t1 - t0) * 1000:.2f} ms")
 
         images, hashes = extract_images_and_hashes(messages)
         cached_images: List[Image.Image] = []
@@ -698,14 +864,23 @@ class HFVLMEngine:
             if h not in self._resized_cache:
                 self._resized_cache[h] = {}
             self._resized_cache[h][side_cap] = rimg
+        t2 = time.perf_counter()
+        print(f"[TIMER] stream image processing: {(t2 - t1) * 1000:.2f} ms")
 
         inputs = self.processor(text=prompt_text, images=(resized or None), return_tensors="pt")
+        t3 = time.perf_counter()
+        print(f"[TIMER] stream processor call: {(t3 - t2) * 1000:.2f} ms")
         try:
-            inputs = inputs.to(self.device)
+            inputs = inputs.to(self.device, self.dtype)
         except Exception:
             for k, v in list(inputs.items()):
                 if hasattr(v, "to"):
-                    inputs[k] = v.to(self.device)
+                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                        inputs[k] = v.to(self.device, dtype=self.dtype)
+                    else:
+                        inputs[k] = v.to(self.device)
+        t4 = time.perf_counter()
+        print(f"[TIMER] stream inputs.to(device): {(t4 - t3) * 1000:.2f} ms")
 
         streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
         gen_kwargs = dict(
@@ -720,14 +895,125 @@ class HFVLMEngine:
         import threading
 
         def _worker():
-            with torch.no_grad():
+            with _inference_context(self.device, self.dtype):
+                t5 = time.perf_counter()
                 self.model.generate(**gen_kwargs)
+                t6 = time.perf_counter()
+                print(f"[TIMER] stream model.generate: {(t6 - t5) * 1000:.2f} ms")
 
-        thread = threading.Thread(target=_worker)
+        thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
 
         for token in streamer:
             yield token
+
+
+class HFTxtEngine:
+    def __init__(self, model_dir: str):
+        if not TRANSFORMERS_AVAILABLE:
+            raise RuntimeError("transformers not available")
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+        # Explicitly trust remote code for all text models
+        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        # Device and dtype
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            dtype = torch.bfloat16
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            dtype = torch.float16  # bfloat16 is not fully supported on MPS
+        else:
+            self.device = torch.device("cpu")
+            dtype = torch.float32
+        self._attn_impl = _select_attn_implementation()
+        # Load tokenizer and model (low_cpu_mem_usage to help large checkpoints)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        if getattr(self.tokenizer, "padding_side", None):
+            self.tokenizer.padding_side = "left"
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            config=config,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            attn_implementation=self._attn_impl,
+        ).to(self.device)
+        self.dtype = next(base_model.parameters()).dtype
+        self.model = _maybe_compile_model(base_model, f"llm:{Path(model_dir).name}")
+        self.model.eval()
+        self._warm_start_done = False
+        if not DISABLE_WARMUP:
+            self._run_warmup()
+
+    def _run_warmup(self) -> None:
+        prompt = "Warmup request."
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            try:
+                inputs = inputs.to(self.device)  # type: ignore[attr-defined]
+            except Exception:
+                for k, v in list(inputs.items()):
+                    if hasattr(v, "to"):
+                        inputs[k] = v.to(self.device)
+            gen_kwargs = dict(
+                **inputs,
+                max_new_tokens=8,
+                do_sample=False,
+                use_cache=True,
+            )
+            t0 = time.perf_counter()
+            with _inference_context(self.device, self.dtype):
+                self.model.generate(**gen_kwargs)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+            t1 = time.perf_counter()
+            self._warm_start_done = True
+            print(f"[warmup] hf text engine ready on {self.device} ({(t1 - t0) * 1000:.1f} ms)")
+        except Exception as exc:  # pragma: no cover - warmup best effort
+            print(f"[warmup] skipped for HF text engine: {exc}")
+
+    def generate(self, messages: List[ChatMessage], gen_cfg: GenerationConfig) -> str:
+        # Convert Pydantic models to dicts for the template
+        chat_dicts = [{"role": m.role, "content": m.content} for m in messages]
+        prompt = self.tokenizer.apply_chat_template(
+            chat_dicts, tokenize=False, add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        try:
+            inputs = inputs.to(self.device)  # type: ignore[attr-defined]
+        except Exception:
+            for k, v in list(inputs.items()):
+                if hasattr(v, "to"):
+                    inputs[k] = v.to(self.device)
+        input_ids_len = inputs["input_ids"].shape[-1]
+        
+        do_sample = bool(gen_cfg.temperature and gen_cfg.temperature > 0.0)
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=int(gen_cfg.max_tokens),
+            do_sample=do_sample,
+            use_cache=True,
+        )
+        if do_sample:
+            gen_kwargs.update(
+                temperature=float(gen_cfg.temperature),
+                top_p=float(gen_cfg.top_p),
+                top_k=int(gen_cfg.top_k),
+            )
+        with _inference_context(self.device, self.dtype):
+            output = self.model.generate(**gen_kwargs)
+        
+        generated_tokens = output[0][len(inputs["input_ids"][0]) :]
+        text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return text.strip()
+
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text))
+
 
 async def generate_stream(engine: VenusEngine, prompt: str, config: GenerationConfig, model: str) -> AsyncGenerator[str, None]:
     """Generate streaming response"""
